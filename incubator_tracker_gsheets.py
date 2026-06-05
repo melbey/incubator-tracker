@@ -23,7 +23,7 @@ import streamlit.components.v1 as components
 
 
 APP_TITLE = "Incubator Tracker"
-APP_VERSION = "instant-browser-v1"
+APP_VERSION = "instant-browser-v1.1-no-alert-layer"
 SWEDEN_TZ = ZoneInfo("Europe/Stockholm")
 
 
@@ -393,9 +393,6 @@ textarea {{
   </div>
 
   <section id="dashboard" class="panel active">
-    <h2>Due / overdue today</h2>
-    <div id="alerts" class="alerts"></div>
-
     <h2>Cultures / Plates</h2>
     <div class="table-wrap">
       <table>
@@ -754,41 +751,7 @@ function renderAll() {{
 }}
 
 function renderAlerts() {{
-  const root = document.getElementById("alerts");
-  root.innerHTML = "";
-  const alerts = [];
-
-  cultures.forEach(c => {{
-    const md = nextMediaDue(c);
-    const sd = nextSplitDue(c);
-    if (md && daysBetween(md, swedenDateObj()) <= 0) {{
-      alerts.push({{ text: `${{c.cell_line}}: media change ${{statusFromDue(md).toLowerCase()}}.`, type: daysBetween(md, swedenDateObj()) < 0 ? "danger" : "warn" }});
-    }}
-    if (sd && daysBetween(sd, swedenDateObj()) <= 0) {{
-      alerts.push({{ text: `${{c.cell_line}}: split check ${{statusFromDue(sd).toLowerCase()}}.`, type: daysBetween(sd, swedenDateObj()) < 0 ? "danger" : "warn" }});
-    }}
-    infectionTimepoints(c).forEach(tp => {{
-      const now = swedenDateObj();
-      if (formatDate(tp.dt) === swedenTodayString() && tp.dt >= now) {{
-        alerts.push({{ text: `${{c.cell_line}}: infection ${{tp.label}} today at ${{formatDatetime(tp.dt).slice(11)}}.`, type: "warn" }});
-      }}
-    }});
-  }});
-
-  if (alerts.length === 0) {{
-    const div = document.createElement("div");
-    div.className = "alert";
-    div.textContent = "No due or overdue tasks today.";
-    root.appendChild(div);
-    return;
-  }}
-
-  alerts.forEach(a => {{
-    const div = document.createElement("div");
-    div.className = `alert ${{a.type}}`;
-    div.textContent = a.text;
-    root.appendChild(div);
-  }});
+  // Alert layer removed. Due/overdue status is shown by table highlighting.
 }}
 
 function renderTable() {{
