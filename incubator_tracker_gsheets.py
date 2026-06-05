@@ -21,7 +21,7 @@ import streamlit as st
 
 
 APP_TITLE = "Incubator Tracker"
-APP_VERSION = "online-apps-script-v1.3-sweden-time-import-fix"
+APP_VERSION = "online-apps-script-v1.4-date-parser-import-repair"
 
 DATE_FMT = "%Y-%m-%d"
 DATETIME_FMT = "%Y-%m-%d %H:%M"
@@ -111,18 +111,38 @@ class Culture:
         value = str(getattr(self, attr) or "").strip()
         if not value:
             return None
+
+        # Google Sheets can return date-looking cells as either
+        # YYYY-MM-DD or YYYY-MM-DD HH:MM, depending on how Sheets stored them.
+        # Accept both so imported local JSON dates are interpreted correctly.
+        for fmt in (DATE_FMT, DATETIME_FMT):
+            try:
+                return datetime.strptime(value, fmt).date()
+            except ValueError:
+                pass
+
+        # Last fallback for ISO-like strings such as 2026-06-05T14:30:00.
         try:
-            return datetime.strptime(value, DATE_FMT).date()
-        except ValueError:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+        except Exception:
             return None
 
     def datetime_value(self, attr: str) -> Optional[datetime]:
         value = str(getattr(self, attr) or "").strip()
         if not value:
             return None
+
+        for fmt in (DATETIME_FMT, DATE_FMT):
+            try:
+                parsed = datetime.strptime(value, fmt)
+                return parsed.replace(second=0, microsecond=0)
+            except ValueError:
+                pass
+
         try:
-            return datetime.strptime(value, DATETIME_FMT)
-        except ValueError:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=None, second=0, microsecond=0)
+        except Exception:
             return None
 
     def plated(self) -> Optional[date]:
@@ -304,6 +324,29 @@ def upsert_culture(cultures: List[Culture], culture: Culture) -> List[Culture]:
     return cultures
 
 
+def repair_missing_schedule_dates(cultures: List[Culture], fill_date: Optional[str] = None) -> tuple[List[Culture], int]:
+    """Fill only missing schedule baseline dates. Existing JSON dates are preserved.
+
+    This is useful after importing old data where the cell lines and PDs exist
+    but plated/media/split date fields are blank. The default fill date is
+    today's date in Sweden.
+    """
+    fill_date = fill_date or sweden_today().strftime(DATE_FMT)
+    changed = 0
+    for c in cultures:
+        before = (c.plated_date, c.last_media_change, c.last_split_check)
+        if not str(c.plated_date or "").strip():
+            c.plated_date = fill_date
+        if not str(c.last_media_change or "").strip():
+            c.last_media_change = c.plated_date or fill_date
+        if not str(c.last_split_check or "").strip():
+            c.last_split_check = c.plated_date or fill_date
+        after = (c.plated_date, c.last_media_change, c.last_split_check)
+        if after != before:
+            changed += 1
+    return cultures, changed
+
+
 def date_input_or_blank(label: str, value: str, key: str) -> str:
     return st.text_input(label, value=value or "", key=key, placeholder="YYYY-MM-DD")
 
@@ -418,6 +461,23 @@ def main() -> None:
 
         st.header("Cultures / Plates")
         df = culture_table(cultures)
+
+        missing_schedule = [
+            c for c in cultures
+            if c.next_media_due() is None or c.next_split_due() is None
+        ]
+        if missing_schedule:
+            st.warning(
+                f"{len(missing_schedule)} culture(s) have no usable plated/media/split date. "
+                "This usually means the old JSON did not contain those dates, or Google Sheets converted them into a date-time format. "
+                "Existing valid dates are preserved."
+            )
+            if st.button("Repair missing schedule dates using today in Sweden"):
+                repaired, changed = repair_missing_schedule_dates(cultures)
+                save_cultures(repaired)
+                st.success(f"Repaired {changed} culture(s) using Sweden date {sweden_today().strftime(DATE_FMT)}.")
+                st.rerun()
+
         edited = st.data_editor(
             df,
             hide_index=True,
@@ -539,7 +599,26 @@ def main() -> None:
                 imported = [Culture.from_dict(item) for item in data]
                 st.success(f"Ready to import {len(imported)} culture record(s). Due dates will be calculated using Sweden time.")
 
+                missing_count = sum(
+                    1 for c in imported
+                    if c.next_media_due() is None or c.next_split_due() is None
+                )
+                repair_on_import = False
+                if missing_count:
+                    st.warning(
+                        f"{missing_count} imported culture(s) have missing/unusable schedule dates. "
+                        "If you leave them as-is, Media/Split will show 'Not set'."
+                    )
+                    repair_on_import = st.checkbox(
+                        "Fill missing plated/media/split dates with today's date in Sweden during import",
+                        value=True,
+                        key="repair_missing_dates_on_import",
+                    )
+
                 if st.button("Replace Google Sheet data with uploaded JSON"):
+                    if repair_on_import:
+                        imported, changed = repair_missing_schedule_dates(imported)
+                        st.info(f"Filled missing schedule dates for {changed} culture(s).")
                     save_cultures(imported)
                     st.success("Imported into Google Sheet.")
                     st.rerun()
