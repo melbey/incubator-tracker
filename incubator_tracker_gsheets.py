@@ -1,234 +1,34 @@
 #!/usr/bin/env python3
 """
-Incubator Tracker - Streamlit + Google Apps Script backend
+Incubator Tracker - Instant browser UI + Google Apps Script sync
 
-This app stores culture data in a Google Sheet through a Google Apps Script web app.
-No service account JSON key is required.
+This version avoids Streamlit reruns for most interactions.
+The UI runs in browser JavaScript and syncs to Google Sheets through Apps Script.
+
+Important security note:
+- APPS_SCRIPT_URL and APPS_SCRIPT_TOKEN are sent to the browser so JavaScript can sync directly.
+- Anyone who can open the public app can potentially inspect/use the token.
+- Use this only if the app/data are not highly sensitive, or keep the Streamlit app private.
 """
 
 from __future__ import annotations
 
+import html
 import json
-import uuid
-from dataclasses import dataclass, asdict, field
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Optional
 
-import pandas as pd
-import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 APP_TITLE = "Incubator Tracker"
-APP_VERSION = "online-apps-script-v1.6.1-faster-clicks-date-repair-fixed"
-
-DATE_FMT = "%Y-%m-%d"
-DATETIME_FMT = "%Y-%m-%d %H:%M"
-MEDIA_INTERVAL_DAYS = 2
-SPLIT_CHECK_INTERVAL_DAYS = 2
-INFECTION_T0_OFFSET_HOURS = 12
-INFECTION_TARGET_HOURS = [72, 84, 96, 108, 120, 132, 144]
-
+APP_VERSION = "instant-browser-v1"
 SWEDEN_TZ = ZoneInfo("Europe/Stockholm")
 
 
-def sweden_now() -> datetime:
-    """Current date/time in Sweden, independent of Streamlit server timezone."""
-    return datetime.now(SWEDEN_TZ).replace(second=0, microsecond=0).replace(tzinfo=None)
-
-
-def sweden_today() -> date:
-    """Current date in Sweden, independent of Streamlit server timezone."""
-    return sweden_now().date()
-
-
-def normalize_date_string(value: Any) -> str:
-    """Normalize JSON / Google Sheets date values to YYYY-MM-DD."""
-    if value is None:
-        return ""
-    if isinstance(value, datetime):
-        return value.strftime(DATE_FMT)
-    if isinstance(value, date):
-        return value.strftime(DATE_FMT)
-
-    text = str(value).strip()
-    if not text or text.lower() in {"none", "nan", "nat"}:
-        return ""
-
-    formats = (
-        DATE_FMT,
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%dT%H:%M:%S.%fZ",
-        "%m/%d/%Y",
-        "%d/%m/%Y",
-    )
-    for fmt in formats:
-        try:
-            return datetime.strptime(text, fmt).strftime(DATE_FMT)
-        except ValueError:
-            pass
-
-    # Fallback for strings like "2026-06-05T18:40:00.000Z"
-    if len(text) >= 10 and text[4:5] == "-" and text[7:8] == "-":
-        return text[:10]
-
-    return text
-
-
-def normalize_datetime_string(value: Any) -> str:
-    """Normalize JSON / Google Sheets datetime values to YYYY-MM-DD HH:MM."""
-    if value is None:
-        return ""
-    if isinstance(value, datetime):
-        return value.strftime(DATETIME_FMT)
-    if isinstance(value, date):
-        return datetime.combine(value, datetime.min.time()).strftime(DATETIME_FMT)
-
-    text = str(value).strip()
-    if not text or text.lower() in {"none", "nan", "nat"}:
-        return ""
-
-    formats = (
-        DATETIME_FMT,
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%dT%H:%M:%S.%fZ",
-    )
-    for fmt in formats:
-        try:
-            return datetime.strptime(text, fmt).strftime(DATETIME_FMT)
-        except ValueError:
-            pass
-
-    if len(text) >= 16 and text[4:5] == "-" and text[7:8] == "-":
-        return text[:16].replace("T", " ")
-
-    return text
-
-
-
-@dataclass
-class Culture:
-    id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    cell_line: str = ""
-    plate_count: int = 1
-    plated_date: str = ""
-    revived_date: str = ""
-    current_pd: float = 0.0
-    pd_date: str = ""
-    last_media_change: str = ""
-    last_split_check: str = ""
-    drug_name: str = ""
-    drug_added_datetime: str = ""
-    infection_active: bool = False
-    first_infection_datetime: str = ""
-    notes: str = ""
-
-    @staticmethod
-    def from_dict(data: Dict[str, Any]) -> "Culture":
-        """Load one culture from either the online format or the old local JSON format."""
-        raw = dict(data or {})
-        defaults = asdict(Culture())
-
-        # Drop unrelated metadata from old JSON files.
-        for key in list(raw.keys()):
-            if key not in defaults:
-                raw.pop(key, None)
-
-        defaults.update(raw)
-        defaults["id"] = str(defaults.get("id") or str(uuid.uuid4()))
-
-        try:
-            defaults["plate_count"] = int(float(defaults.get("plate_count") or 0))
-        except Exception:
-            defaults["plate_count"] = 0
-
-        try:
-            defaults["current_pd"] = float(defaults.get("current_pd") or 0)
-        except Exception:
-            defaults["current_pd"] = 0.0
-
-        active = defaults.get("infection_active")
-        if isinstance(active, str):
-            defaults["infection_active"] = active.strip().lower() in {"true", "1", "yes", "y", "on"}
-        else:
-            defaults["infection_active"] = bool(active)
-
-        for key in ["plated_date", "revived_date", "pd_date", "last_media_change", "last_split_check"]:
-            defaults[key] = normalize_date_string(defaults.get(key))
-
-        for key in ["drug_added_datetime", "first_infection_datetime"]:
-            defaults[key] = normalize_datetime_string(defaults.get(key))
-
-        for key in ["cell_line", "drug_name", "notes"]:
-            defaults[key] = "" if defaults.get(key) is None else str(defaults.get(key))
-
-        return Culture(**defaults)
-
-    def date_value(self, attr: str) -> Optional[date]:
-        value = normalize_date_string(getattr(self, attr) or "")
-        if not value:
-            return None
-        try:
-            return datetime.strptime(value, DATE_FMT).date()
-        except ValueError:
-            return None
-
-    def datetime_value(self, attr: str) -> Optional[datetime]:
-        value = normalize_datetime_string(getattr(self, attr) or "")
-        if not value:
-            return None
-        try:
-            return datetime.strptime(value, DATETIME_FMT)
-        except ValueError:
-            return None
-
-    def plated(self) -> Optional[date]:
-        return self.date_value("plated_date")
-
-    def pd_record_date(self) -> Optional[date]:
-        return self.date_value("pd_date")
-
-    def last_media(self) -> Optional[date]:
-        return self.date_value("last_media_change") or self.plated()
-
-    def last_split(self) -> Optional[date]:
-        return self.date_value("last_split_check") or self.plated()
-
-    def drug_added(self) -> Optional[datetime]:
-        return self.datetime_value("drug_added_datetime")
-
-    def first_infection(self) -> Optional[datetime]:
-        return self.datetime_value("first_infection_datetime")
-
-    def next_media_due(self) -> Optional[date]:
-        d = self.last_media()
-        return d + timedelta(days=MEDIA_INTERVAL_DAYS) if d else None
-
-    def next_split_due(self) -> Optional[date]:
-        d = self.last_split()
-        return d + timedelta(days=SPLIT_CHECK_INTERVAL_DAYS) if d else None
-
-    def effective_pd_today(self) -> float:
-        d = self.pd_record_date()
-        if d is None:
-            return self.current_pd
-        return self.current_pd + max(0, (sweden_today() - d).days)
-
-    def infection_timepoints(self) -> List[tuple[str, datetime]]:
-        first = self.first_infection()
-        if not first or not self.infection_active:
-            return []
-        t0 = first + timedelta(hours=INFECTION_T0_OFFSET_HOURS)
-        rows = [("t=0", t0)]
-        for h in INFECTION_TARGET_HOURS:
-            rows.append((f"{h} h", t0 + timedelta(hours=h)))
-        return rows
+def sweden_now_str() -> str:
+    return datetime.now(SWEDEN_TZ).replace(second=0, microsecond=0).strftime("%Y-%m-%d %H:%M")
 
 
 def get_secret(name: str, default: str = "") -> str:
@@ -238,281 +38,20 @@ def get_secret(name: str, default: str = "") -> str:
         return default
 
 
-def backend_url() -> str:
-    return get_secret("APPS_SCRIPT_URL", "").strip()
-
-
-def backend_token() -> str:
-    return get_secret("APPS_SCRIPT_TOKEN", "").strip()
-
-
-def api_call(action: str, cultures: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-    url = backend_url()
-    if not url:
-        raise RuntimeError("Missing APPS_SCRIPT_URL in Streamlit secrets.")
-
-    payload: Dict[str, Any] = {
-        "action": action,
-        "token": backend_token(),
-    }
-    if cultures is not None:
-        payload["cultures"] = cultures
-
-    response = requests.post(url, json=payload, timeout=30)
-    response.raise_for_status()
-    data = response.json()
-
-    if not data.get("ok"):
-        raise RuntimeError(data.get("error", "Unknown backend error."))
-
-    return data
-
-
-@st.cache_data(ttl=120, show_spinner=False)
-def load_cultures_cached() -> List[Dict[str, Any]]:
-    """Network load from Google Sheets backend. Cached to avoid reloading on every click."""
-    return api_call("load").get("cultures", [])
-
-
-def force_reload_cultures() -> List[Culture]:
-    """Force a fresh load from Google Sheets into the current Streamlit session."""
-    load_cultures_cached.clear()
-    cultures = [Culture.from_dict(item) for item in load_cultures_cached()]
-    st.session_state["cultures"] = cultures
-    return cultures
-
-
-def load_cultures() -> List[Culture]:
-    """Load cultures from session memory first, avoiding a backend call on checkbox clicks."""
-    if "cultures" not in st.session_state:
-        st.session_state["cultures"] = [Culture.from_dict(item) for item in load_cultures_cached()]
-    return st.session_state["cultures"]
-
-
-def save_cultures(cultures: List[Culture]) -> None:
-    """Save to Google Sheets and keep the current session state in sync."""
-    st.session_state["cultures"] = cultures
-    api_call("save", [asdict(c) for c in cultures])
-    load_cultures_cached.clear()
-
-
-def repair_missing_schedule_dates(cultures: List[Culture]) -> int:
-    """Fill missing baseline dates so Media/Split due dates can be calculated."""
-    today_str = sweden_today().strftime(DATE_FMT)
-    changed = 0
-
-    for c in cultures:
-        if not normalize_date_string(c.plated_date):
-            c.plated_date = today_str
-            changed += 1
-        if not normalize_date_string(c.last_media_change):
-            c.last_media_change = normalize_date_string(c.plated_date) or today_str
-            changed += 1
-        if not normalize_date_string(c.last_split_check):
-            c.last_split_check = normalize_date_string(c.plated_date) or today_str
-            changed += 1
-
-        c.plated_date = normalize_date_string(c.plated_date)
-        c.last_media_change = normalize_date_string(c.last_media_change)
-        c.last_split_check = normalize_date_string(c.last_split_check)
-
-    if changed:
-        save_cultures(cultures)
-    return changed
-
-
-def status_from_due(due: Optional[date]) -> str:
-    if due is None:
-        return "Not set"
-    delta = (due - sweden_today()).days
-    if delta < 0:
-        return f"OVERDUE by {-delta} day(s)"
-    if delta == 0:
-        return "Due today"
-    if delta == 1:
-        return "Due tomorrow"
-    return f"Due in {delta} days"
-
-
-def action_status(last_done: Optional[date], due: Optional[date]) -> str:
-    if last_done == sweden_today() and due is not None:
-        delta = (due - sweden_today()).days
-        if delta == 1:
-            return "Done today; next tomorrow"
-        return f"Done today; next in {delta} days"
-    return status_from_due(due)
-
-
-def human_duration_since(dt: Optional[datetime]) -> str:
-    if not dt:
-        return ""
-    delta = sweden_now() - dt
-    future = delta.total_seconds() < 0
-    if future:
-        delta = -delta
-
-    minutes_total = int(delta.total_seconds() // 60)
-    days, rem = divmod(minutes_total, 24 * 60)
-    hours, minutes = divmod(rem, 60)
-
-    if days:
-        text = f"{days} d {hours} h" if hours else f"{days} d"
-    elif hours:
-        text = f"{hours} h {minutes} min" if minutes else f"{hours} h"
-    else:
-        text = f"{minutes} min"
-    return f"in {text}" if future else text
-
-
-def drug_status(c: Culture) -> str:
-    if not c.drug_name.strip():
-        return "None"
-    added = c.drug_added()
-    if not added:
-        return c.drug_name.strip()
-    return f"{c.drug_name.strip()} — {human_duration_since(added)}"
-
-
-def culture_table(cultures: List[Culture]) -> pd.DataFrame:
-    rows = []
-    for c in sorted(cultures, key=lambda x: x.cell_line.lower()):
-        rows.append({
-            "Select": False,
-            "id": c.id,
-            "Cell line": c.cell_line,
-            "Plates": c.plate_count,
-            "PD today": round(c.effective_pd_today(), 1),
-            "Media": action_status(c.last_media(), c.next_media_due()),
-            "Split": action_status(c.last_split(), c.next_split_due()),
-            "Drug exposure": drug_status(c),
-            "Infection": "Yes" if c.infection_active else "No",
-        })
-    return pd.DataFrame(rows)
-
-
-def selected_cultures_from_editor(df: pd.DataFrame, cultures: List[Culture]) -> List[Culture]:
-    if df.empty or "Select" not in df.columns:
-        return []
-    selected_ids = set(df.loc[df["Select"] == True, "id"].astype(str).tolist())
-    return [c for c in cultures if c.id in selected_ids]
-
-
-def upsert_culture(cultures: List[Culture], culture: Culture) -> List[Culture]:
-    for i, existing in enumerate(cultures):
-        if existing.id == culture.id:
-            cultures[i] = culture
-            return cultures
-    cultures.append(culture)
-    return cultures
-
-
-def date_input_or_blank(label: str, value: str, key: str) -> str:
-    return st.text_input(label, value=value or "", key=key, placeholder="YYYY-MM-DD")
-
-
-def datetime_input_or_blank(label: str, value: str, key: str) -> str:
-    return st.text_input(label, value=value or "", key=key, placeholder="YYYY-MM-DD HH:MM")
-
-
-def validate_date(value: str, label: str, required: bool = False) -> str:
-    value = value.strip()
-    if not value:
-        if required:
-            raise ValueError(f"{label} is required.")
-        return ""
-    datetime.strptime(value, DATE_FMT)
-    return value
-
-
-def validate_datetime(value: str, label: str) -> str:
-    value = value.strip()
-    if not value:
-        return ""
-    datetime.strptime(value, DATETIME_FMT)
-    return value
-
-
-def render_form(cultures: List[Culture], editing: Optional[Culture] = None, form_key: str = "form") -> None:
-    c = editing or Culture(pd_date=sweden_today().strftime(DATE_FMT))
-    title = "Edit culture" if editing else "Add culture"
-    key_prefix = f"{form_key}_{c.id}"
-    with st.form(f"{title}_{key_prefix}"):
-        st.subheader(title)
-        cell_line = st.text_input("Cell line", c.cell_line, key=f"{key_prefix}_cell_line")
-        plate_count = st.number_input("Number of plates", min_value=0, value=int(c.plate_count), step=1, key=f"{key_prefix}_plate_count")
-        plated_date = date_input_or_blank("Date plated", c.plated_date, f"{key_prefix}_plated_date")
-        revived_date = date_input_or_blank("Date revived", c.revived_date, f"{key_prefix}_revived_date")
-        current_pd = st.number_input("Current PD", value=float(c.current_pd), step=0.5, key=f"{key_prefix}_current_pd")
-        pd_date = date_input_or_blank("PD date", c.pd_date, f"{key_prefix}_pd_date")
-        last_media = date_input_or_blank("Last media change", c.last_media_change, f"{key_prefix}_last_media")
-        last_split = date_input_or_blank("Last split check", c.last_split_check, f"{key_prefix}_last_split")
-        drug_name = st.text_input("Drug name", c.drug_name, key=f"{key_prefix}_drug_name")
-        drug_added = datetime_input_or_blank("Drug added", c.drug_added_datetime, f"{key_prefix}_drug_added")
-        infection_active = st.checkbox("Infection active", value=bool(c.infection_active), key=f"{key_prefix}_infection_active")
-        first_infection = datetime_input_or_blank("1st infection", c.first_infection_datetime, f"{key_prefix}_first_infection")
-        notes = st.text_area("Notes", c.notes, key=f"{key_prefix}_notes")
-        submitted = st.form_submit_button("Save")
-
-    if submitted:
-        try:
-            if not cell_line.strip():
-                raise ValueError("Cell line is required.")
-            c.cell_line = cell_line.strip()
-            c.plate_count = int(plate_count)
-            c.plated_date = validate_date(plated_date, "Date plated")
-            c.revived_date = validate_date(revived_date, "Date revived")
-            c.current_pd = float(current_pd)
-            c.pd_date = validate_date(pd_date, "PD date")
-            c.last_media_change = validate_date(last_media, "Last media change")
-            c.last_split_check = validate_date(last_split, "Last split check")
-            c.drug_name = drug_name.strip()
-            c.drug_added_datetime = validate_datetime(drug_added, "Drug added")
-            c.infection_active = bool(infection_active)
-            c.first_infection_datetime = validate_datetime(first_infection, "1st infection")
-            c.notes = notes.strip()
-
-            save_cultures(upsert_culture(cultures, c))
-            st.success("Saved.")
-            st.rerun()
-        except ValueError as exc:
-            st.error(str(exc))
-
-
-def render_alerts(cultures: List[Culture]) -> None:
-    alerts = []
-    for c in cultures:
-        media_due = c.next_media_due()
-        split_due = c.next_split_due()
-        if media_due and media_due <= sweden_today():
-            alerts.append(f"{c.cell_line}: media change {status_from_due(media_due).lower()}.")
-        if split_due and split_due <= sweden_today():
-            alerts.append(f"{c.cell_line}: split check {status_from_due(split_due).lower()}.")
-        if c.infection_active:
-            now = sweden_now()
-            for label, dt in c.infection_timepoints():
-                if dt.date() == sweden_today() and dt >= now:
-                    alerts.append(f"{c.cell_line}: infection {label} today at {dt.strftime('%H:%M')}.")
-    if not alerts:
-        st.info("No due or overdue tasks today.")
-    else:
-        for alert in alerts:
-            st.warning(alert)
-
-
-
-def inject_low_flicker_css() -> None:
-    """Reduce the grey/transparent flicker that appears during Streamlit reruns."""
+def inject_css() -> None:
     st.markdown(
         """
         <style>
-        .stApp { transition: none !important; }
-        [data-testid="stStatusWidget"] { display: none !important; }
-        button, input, textarea, select, [role="button"], [data-testid="stDataFrame"] {
-            transition: none !important;
-        }
         .block-container {
-            padding-top: 2rem;
-            padding-bottom: 2rem;
+            padding-top: 1.5rem;
+            padding-bottom: 1rem;
+            max-width: 100%;
+        }
+        [data-testid="stStatusWidget"] {
+            display: none !important;
+        }
+        iframe {
+            border: 0 !important;
         }
         </style>
         """,
@@ -520,181 +59,1176 @@ def inject_low_flicker_css() -> None:
     )
 
 
+def app_html(apps_script_url: str, apps_script_token: str) -> str:
+    url_js = json.dumps(apps_script_url)
+    token_js = json.dumps(apps_script_token)
+
+    return f"""
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+:root {{
+  color-scheme: light dark;
+  --bg: #0e1117;
+  --panel: #161b22;
+  --panel2: #1f2630;
+  --text: #f0f3f6;
+  --muted: #9ca3af;
+  --border: rgba(255,255,255,.12);
+  --accent: #ff4b4b;
+  --accent2: #2563eb;
+  --good: #22c55e;
+  --warn: #f59e0b;
+  --danger: #ef4444;
+  --button: #262d38;
+  --button-hover: #303847;
+}}
+
+* {{
+  box-sizing: border-box;
+}}
+
+html, body {{
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}}
+
+body {{
+  padding: 10px 12px 60px;
+}}
+
+.header {{
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}}
+
+h1 {{
+  font-size: clamp(1.7rem, 4vw, 2.6rem);
+  margin: 0 0 .25rem;
+}}
+
+h2 {{
+  margin: 1.3rem 0 .7rem;
+}}
+
+.subtitle {{
+  color: var(--muted);
+  font-size: .9rem;
+}}
+
+.toolbar {{
+  display: flex;
+  flex-wrap: wrap;
+  gap: .5rem;
+  align-items: center;
+  justify-content: flex-end;
+}}
+
+button {{
+  border: 1px solid var(--border);
+  background: var(--button);
+  color: var(--text);
+  padding: .55rem .75rem;
+  border-radius: .55rem;
+  cursor: pointer;
+  font-weight: 650;
+  min-height: 38px;
+}}
+
+button:hover {{
+  background: var(--button-hover);
+}}
+
+button.primary {{
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}}
+
+button.blue {{
+  background: var(--accent2);
+  border-color: var(--accent2);
+  color: white;
+}}
+
+button.danger {{
+  color: #fecaca;
+}}
+
+button:disabled {{
+  opacity: .45;
+  cursor: not-allowed;
+}}
+
+.status {{
+  color: var(--muted);
+  font-size: .86rem;
+  min-height: 1.4rem;
+  margin-bottom: .6rem;
+}}
+
+.tabs {{
+  display: flex;
+  flex-wrap: wrap;
+  gap: .35rem;
+  border-bottom: 1px solid var(--border);
+  margin: 1rem 0;
+}}
+
+.tab {{
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+}}
+
+.tab.active {{
+  color: #ff7777;
+  border-bottom-color: var(--accent);
+}}
+
+.panel {{
+  display: none;
+}}
+
+.panel.active {{
+  display: block;
+}}
+
+.alerts {{
+  display: flex;
+  flex-direction: column;
+  gap: .5rem;
+  margin-bottom: 1rem;
+}}
+
+.alert {{
+  border: 1px solid var(--border);
+  background: rgba(37, 99, 235, .12);
+  border-radius: .6rem;
+  padding: .8rem 1rem;
+}}
+
+.alert.warn {{
+  background: rgba(245, 158, 11, .14);
+}}
+
+.alert.danger {{
+  background: rgba(239, 68, 68, .14);
+}}
+
+.table-wrap {{
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: .75rem;
+  max-height: 58vh;
+}}
+
+table {{
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 980px;
+}}
+
+th, td {{
+  border-bottom: 1px solid var(--border);
+  padding: .55rem .65rem;
+  text-align: left;
+  white-space: nowrap;
+}}
+
+th {{
+  position: sticky;
+  top: 0;
+  background: var(--panel2);
+  z-index: 2;
+  color: var(--muted);
+  font-weight: 700;
+}}
+
+tr.selected {{
+  background: rgba(255, 75, 75, .13);
+}}
+
+tr.overdue td {{
+  color: #fecaca;
+}}
+
+tr.due td {{
+  color: #fde68a;
+}}
+
+.quick-actions {{
+  display: flex;
+  flex-wrap: wrap;
+  gap: .5rem;
+  margin: .9rem 0;
+  align-items: center;
+}}
+
+.selected-count {{
+  color: var(--muted);
+  margin-right: .5rem;
+}}
+
+.form-grid {{
+  display: grid;
+  grid-template-columns: repeat(2, minmax(220px, 1fr));
+  gap: .8rem;
+  max-width: 950px;
+}}
+
+label {{
+  display: block;
+  color: var(--muted);
+  font-size: .85rem;
+  margin-bottom: .25rem;
+}}
+
+input, textarea, select {{
+  width: 100%;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: .55rem;
+  padding: .65rem .75rem;
+  font-size: 1rem;
+  min-height: 42px;
+}}
+
+textarea {{
+  min-height: 110px;
+  resize: vertical;
+}}
+
+.full {{
+  grid-column: 1 / -1;
+}}
+
+.form-actions {{
+  display: flex;
+  gap: .5rem;
+  flex-wrap: wrap;
+  margin-top: .9rem;
+}}
+
+.card {{
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: .75rem;
+  padding: 1rem;
+  margin-bottom: .8rem;
+}}
+
+.raw-pre {{
+  white-space: pre-wrap;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: .75rem;
+  padding: 1rem;
+  max-height: 60vh;
+  overflow: auto;
+}}
+
+.hidden {{
+  display: none !important;
+}}
+
+@media (max-width: 850px) {{
+  body {{
+    padding: 8px 8px 80px;
+  }}
+
+  .header {{
+    display: block;
+  }}
+
+  .toolbar {{
+    justify-content: flex-start;
+    margin-top: .75rem;
+  }}
+
+  .form-grid {{
+    grid-template-columns: 1fr;
+  }}
+
+  .quick-actions button {{
+    flex: 1 1 45%;
+  }}
+}}
+</style>
+</head>
+<body>
+  <div class="header">
+    <div>
+      <h1>Incubator Tracker</h1>
+      <div class="subtitle">{html.escape(APP_VERSION)} · Sweden time: <span id="swedenTime"></span></div>
+    </div>
+    <div class="toolbar">
+      <button id="reloadBtn">Reload</button>
+      <button id="saveBtn" class="primary">Save now</button>
+      <button id="exportBtn">Export JSON</button>
+      <button id="importBtn">Import JSON</button>
+      <input id="importFile" type="file" accept=".json,application/json" style="display:none" />
+    </div>
+  </div>
+
+  <div id="status" class="status">Starting...</div>
+
+  <div class="tabs">
+    <button class="tab active" data-tab="dashboard">Dashboard</button>
+    <button class="tab" data-tab="add">Add culture</button>
+    <button class="tab" data-tab="edit">Edit selected</button>
+    <button class="tab" data-tab="infection">Infection timepoints</button>
+    <button class="tab" data-tab="raw">Raw data</button>
+  </div>
+
+  <section id="dashboard" class="panel active">
+    <h2>Due / overdue today</h2>
+    <div id="alerts" class="alerts"></div>
+
+    <h2>Cultures / Plates</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Select</th>
+            <th>Cell line</th>
+            <th>Plates</th>
+            <th>PD today</th>
+            <th>Media</th>
+            <th>Split</th>
+            <th>Drug exposure</th>
+            <th>Infection</th>
+          </tr>
+        </thead>
+        <tbody id="cultureRows"></tbody>
+      </table>
+    </div>
+
+    <div class="quick-actions">
+      <span class="selected-count">Selected: <span id="selectedCount">0</span></span>
+      <button id="mediaTodayBtn" disabled>Media changed today</button>
+      <button id="splitTodayBtn" disabled>Split checked today</button>
+      <button id="recordSplitBtn" disabled>Record split today</button>
+      <button id="infectionNowBtn" disabled>1st infection now</button>
+      <button id="repairDatesBtn">Repair missing dates</button>
+    </div>
+
+    <div id="selectedDetails"></div>
+  </section>
+
+  <section id="add" class="panel">
+    <h2>Add culture</h2>
+    <div id="addForm"></div>
+  </section>
+
+  <section id="edit" class="panel">
+    <h2>Edit selected culture</h2>
+    <div id="editEmpty" class="card">Select one culture from the dashboard first.</div>
+    <div id="editForm"></div>
+  </section>
+
+  <section id="infection" class="panel">
+    <h2>Infection timepoints</h2>
+    <div id="infectionRows" class="card"></div>
+  </section>
+
+  <section id="raw" class="panel">
+    <h2>Raw data</h2>
+    <pre id="rawData" class="raw-pre"></pre>
+  </section>
+
+<script>
+const APPS_SCRIPT_URL = {url_js};
+const APPS_SCRIPT_TOKEN = {token_js};
+
+const DATE_FMT_RE = /^\\d{{4}}-\\d{{2}}-\\d{{2}}$/;
+const DATETIME_FMT_RE = /^\\d{{4}}-\\d{{2}}-\\d{{2}} \\d{{2}}:\\d{{2}}$/;
+const MEDIA_INTERVAL_DAYS = 2;
+const SPLIT_CHECK_INTERVAL_DAYS = 2;
+const INFECTION_T0_OFFSET_HOURS = 12;
+const INFECTION_TARGET_HOURS = [72, 84, 96, 108, 120, 132, 144];
+
+let cultures = [];
+let selectedIds = new Set();
+let saveTimer = null;
+let saving = false;
+let dirty = false;
+let lastSavedJson = "";
+
+function uuid() {{
+  if (crypto && crypto.randomUUID) return crypto.randomUUID();
+  return "culture-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
+}}
+
+function setStatus(text, kind="") {{
+  const el = document.getElementById("status");
+  el.textContent = text;
+  el.style.color = kind === "error" ? "#f87171" : kind === "ok" ? "#86efac" : "var(--muted)";
+}}
+
+function swedenDateObj() {{
+  const parts = new Intl.DateTimeFormat("sv-SE", {{
+    timeZone: "Europe/Stockholm",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }}).formatToParts(new Date());
+
+  const get = type => parts.find(p => p.type === type).value;
+  return new Date(Number(get("year")), Number(get("month")) - 1, Number(get("day")), Number(get("hour")), Number(get("minute")));
+}}
+
+function swedenTodayString() {{
+  const d = swedenDateObj();
+  return formatDate(d);
+}}
+
+function swedenNowString() {{
+  const d = swedenDateObj();
+  return formatDatetime(d);
+}}
+
+function pad(n) {{
+  return String(n).padStart(2, "0");
+}}
+
+function formatDate(d) {{
+  return `${{d.getFullYear()}}-${{pad(d.getMonth() + 1)}}-${{pad(d.getDate())}}`;
+}}
+
+function formatDatetime(d) {{
+  return `${{formatDate(d)}} ${{pad(d.getHours())}}:${{pad(d.getMinutes())}}`;
+}}
+
+function parseDate(value) {{
+  value = normalizeDateString(value);
+  if (!value || !DATE_FMT_RE.test(value)) return null;
+  const [y, m, d] = value.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}}
+
+function parseDatetime(value) {{
+  value = normalizeDatetimeString(value);
+  if (!value || !DATETIME_FMT_RE.test(value)) return null;
+  const [datePart, timePart] = value.split(" ");
+  const [y, m, d] = datePart.split("-").map(Number);
+  const [hh, mm] = timePart.split(":").map(Number);
+  return new Date(y, m - 1, d, hh, mm);
+}}
+
+function addDays(d, days) {{
+  const copy = new Date(d);
+  copy.setDate(copy.getDate() + days);
+  return copy;
+}}
+
+function addHours(d, hours) {{
+  const copy = new Date(d);
+  copy.setHours(copy.getHours() + hours);
+  return copy;
+}}
+
+function daysBetween(a, b) {{
+  const aa = new Date(a.getFullYear(), a.getMonth(), a.getDate());
+  const bb = new Date(b.getFullYear(), b.getMonth(), b.getDate());
+  return Math.round((aa - bb) / (1000 * 60 * 60 * 24));
+}}
+
+function normalizeDateString(value) {{
+  if (value === null || value === undefined) return "";
+  let text = String(value).trim();
+  if (!text || ["none", "nan", "nat"].includes(text.toLowerCase())) return "";
+  if (DATE_FMT_RE.test(text)) return text;
+  if (text.length >= 10 && text[4] === "-" && text[7] === "-") return text.slice(0, 10);
+  return text;
+}}
+
+function normalizeDatetimeString(value) {{
+  if (value === null || value === undefined) return "";
+  let text = String(value).trim();
+  if (!text || ["none", "nan", "nat"].includes(text.toLowerCase())) return "";
+  if (DATETIME_FMT_RE.test(text)) return text;
+  if (text.length >= 16 && text[4] === "-" && text[7] === "-") return text.slice(0, 16).replace("T", " ");
+  return text;
+}}
+
+function normalizeCulture(item) {{
+  item = item || {{}};
+  const activeRaw = item.infection_active;
+  let infectionActive = false;
+  if (typeof activeRaw === "string") {{
+    infectionActive = ["true", "1", "yes", "y", "on"].includes(activeRaw.trim().toLowerCase());
+  }} else {{
+    infectionActive = Boolean(activeRaw);
+  }}
+
+  return {{
+    id: String(item.id || uuid()),
+    cell_line: String(item.cell_line || ""),
+    plate_count: Number(item.plate_count || 0),
+    plated_date: normalizeDateString(item.plated_date),
+    revived_date: normalizeDateString(item.revived_date),
+    current_pd: Number(item.current_pd || 0),
+    pd_date: normalizeDateString(item.pd_date),
+    last_media_change: normalizeDateString(item.last_media_change),
+    last_split_check: normalizeDateString(item.last_split_check),
+    drug_name: String(item.drug_name || ""),
+    drug_added_datetime: normalizeDatetimeString(item.drug_added_datetime),
+    infection_active: infectionActive,
+    first_infection_datetime: normalizeDatetimeString(item.first_infection_datetime),
+    notes: String(item.notes || "")
+  }};
+}}
+
+async function api(action, payload={{}}) {{
+  const res = await fetch(APPS_SCRIPT_URL, {{
+    method: "POST",
+    headers: {{ "Content-Type": "text/plain;charset=utf-8" }},
+    body: JSON.stringify({{
+      action,
+      token: APPS_SCRIPT_TOKEN,
+      ...payload
+    }})
+  }});
+
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || "Unknown backend error");
+  return data;
+}}
+
+async function loadCultures() {{
+  try {{
+    setStatus("Loading from Google Sheets...");
+    const data = await api("load");
+    cultures = (data.cultures || []).map(normalizeCulture);
+    lastSavedJson = JSON.stringify(cultures);
+    dirty = false;
+    selectedIds.clear();
+    renderAll();
+    setStatus("Loaded. Ready.", "ok");
+  }} catch (err) {{
+    setStatus("Could not load: " + err.message, "error");
+    renderAll();
+  }}
+}}
+
+async function saveCultures(force=false) {{
+  if (saving) return;
+  const currentJson = JSON.stringify(cultures);
+  if (!force && currentJson === lastSavedJson) {{
+    dirty = false;
+    return;
+  }}
+
+  saving = true;
+  setStatus("Saving...");
+  try {{
+    await api("save", {{ cultures }});
+    lastSavedJson = JSON.stringify(cultures);
+    dirty = false;
+    setStatus("Saved.", "ok");
+  }} catch (err) {{
+    setStatus("Save failed: " + err.message, "error");
+  }} finally {{
+    saving = false;
+  }}
+}}
+
+function scheduleSave(delay=650) {{
+  dirty = true;
+  setStatus("Changed locally. Saving soon...");
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => saveCultures(false), delay);
+}}
+
+function statusFromDue(due) {{
+  if (!due) return "Not set";
+  const delta = daysBetween(due, swedenDateObj());
+  if (delta < 0) return `OVERDUE by ${{-delta}} day(s)`;
+  if (delta === 0) return "Due today";
+  if (delta === 1) return "Due tomorrow";
+  return `Due in ${{delta}} days`;
+}}
+
+function actionStatus(lastDone, due) {{
+  const today = swedenTodayString();
+  if (lastDone && normalizeDateString(lastDone) === today && due) {{
+    const delta = daysBetween(due, swedenDateObj());
+    if (delta === 1) return "Done today; next tomorrow";
+    return `Done today; next in ${{delta}} days`;
+  }}
+  return statusFromDue(due);
+}}
+
+function lastMedia(c) {{
+  return parseDate(c.last_media_change) || parseDate(c.plated_date);
+}}
+
+function lastSplit(c) {{
+  return parseDate(c.last_split_check) || parseDate(c.plated_date);
+}}
+
+function nextMediaDue(c) {{
+  const d = lastMedia(c);
+  return d ? addDays(d, MEDIA_INTERVAL_DAYS) : null;
+}}
+
+function nextSplitDue(c) {{
+  const d = lastSplit(c);
+  return d ? addDays(d, SPLIT_CHECK_INTERVAL_DAYS) : null;
+}}
+
+function effectivePdToday(c) {{
+  const pdDate = parseDate(c.pd_date);
+  if (!pdDate) return Number(c.current_pd || 0);
+  const elapsed = Math.max(0, daysBetween(swedenDateObj(), pdDate));
+  return Number(c.current_pd || 0) + elapsed;
+}}
+
+function humanDurationSince(dt) {{
+  if (!dt) return "";
+  let deltaMs = swedenDateObj() - dt;
+  const future = deltaMs < 0;
+  if (future) deltaMs = -deltaMs;
+
+  const totalMinutes = Math.floor(deltaMs / (1000 * 60));
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const rem = totalMinutes % (24 * 60);
+  const hours = Math.floor(rem / 60);
+  const minutes = rem % 60;
+
+  let text;
+  if (days >= 1) text = hours ? `${{days}} d ${{hours}} h` : `${{days}} d`;
+  else if (hours >= 1) text = minutes ? `${{hours}} h ${{minutes}} min` : `${{hours}} h`;
+  else text = `${{minutes}} min`;
+  return future ? `in ${{text}}` : text;
+}}
+
+function drugStatus(c) {{
+  if (!c.drug_name.trim()) return "None";
+  const dt = parseDatetime(c.drug_added_datetime);
+  if (!dt) return c.drug_name.trim();
+  return `${{c.drug_name.trim()}} — ${{humanDurationSince(dt)}}`;
+}}
+
+function infectionTimepoints(c) {{
+  const first = parseDatetime(c.first_infection_datetime);
+  if (!first || !c.infection_active) return [];
+  const t0 = addHours(first, INFECTION_T0_OFFSET_HOURS);
+  const rows = [{{ label: "t=0", dt: t0 }}];
+  INFECTION_TARGET_HOURS.forEach(h => rows.push({{ label: `${{h}} h`, dt: addHours(t0, h) }}));
+  return rows;
+}}
+
+function selectedCultures() {{
+  return cultures.filter(c => selectedIds.has(c.id));
+}}
+
+function sortCultures(list) {{
+  return [...list].sort((a, b) => a.cell_line.toLowerCase().localeCompare(b.cell_line.toLowerCase()));
+}}
+
+function renderAll() {{
+  renderAlerts();
+  renderTable();
+  renderQuickActions();
+  renderSelectedDetails();
+  renderEditForm();
+  renderInfection();
+  renderRaw();
+}}
+
+function renderAlerts() {{
+  const root = document.getElementById("alerts");
+  root.innerHTML = "";
+  const alerts = [];
+
+  cultures.forEach(c => {{
+    const md = nextMediaDue(c);
+    const sd = nextSplitDue(c);
+    if (md && daysBetween(md, swedenDateObj()) <= 0) {{
+      alerts.push({{ text: `${{c.cell_line}}: media change ${{statusFromDue(md).toLowerCase()}}.`, type: daysBetween(md, swedenDateObj()) < 0 ? "danger" : "warn" }});
+    }}
+    if (sd && daysBetween(sd, swedenDateObj()) <= 0) {{
+      alerts.push({{ text: `${{c.cell_line}}: split check ${{statusFromDue(sd).toLowerCase()}}.`, type: daysBetween(sd, swedenDateObj()) < 0 ? "danger" : "warn" }});
+    }}
+    infectionTimepoints(c).forEach(tp => {{
+      const now = swedenDateObj();
+      if (formatDate(tp.dt) === swedenTodayString() && tp.dt >= now) {{
+        alerts.push({{ text: `${{c.cell_line}}: infection ${{tp.label}} today at ${{formatDatetime(tp.dt).slice(11)}}.`, type: "warn" }});
+      }}
+    }});
+  }});
+
+  if (alerts.length === 0) {{
+    const div = document.createElement("div");
+    div.className = "alert";
+    div.textContent = "No due or overdue tasks today.";
+    root.appendChild(div);
+    return;
+  }}
+
+  alerts.forEach(a => {{
+    const div = document.createElement("div");
+    div.className = `alert ${{a.type}}`;
+    div.textContent = a.text;
+    root.appendChild(div);
+  }});
+}}
+
+function renderTable() {{
+  const tbody = document.getElementById("cultureRows");
+  tbody.innerHTML = "";
+
+  sortCultures(cultures).forEach(c => {{
+    const mediaStatus = actionStatus(c.last_media_change || c.plated_date, nextMediaDue(c));
+    const splitStatus = actionStatus(c.last_split_check || c.plated_date, nextSplitDue(c));
+
+    const tr = document.createElement("tr");
+    if (selectedIds.has(c.id)) tr.classList.add("selected");
+    if (mediaStatus.includes("OVERDUE") || splitStatus.includes("OVERDUE")) tr.classList.add("overdue");
+    else if (mediaStatus === "Due today" || splitStatus === "Due today") tr.classList.add("due");
+
+    const checkboxCell = document.createElement("td");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = selectedIds.has(c.id);
+    cb.addEventListener("change", () => {{
+      if (cb.checked) selectedIds.add(c.id);
+      else selectedIds.delete(c.id);
+      renderAll();
+    }});
+    checkboxCell.appendChild(cb);
+    tr.appendChild(checkboxCell);
+
+    [
+      c.cell_line,
+      String(c.plate_count),
+      effectivePdToday(c).toFixed(1),
+      mediaStatus,
+      splitStatus,
+      drugStatus(c),
+      c.infection_active ? "Yes" : "No"
+    ].forEach(text => {{
+      const td = document.createElement("td");
+      td.textContent = text;
+      tr.appendChild(td);
+    }});
+
+    tbody.appendChild(tr);
+  }});
+}}
+
+function renderQuickActions() {{
+  const selected = selectedCultures();
+  document.getElementById("selectedCount").textContent = String(selected.length);
+  ["mediaTodayBtn", "splitTodayBtn", "recordSplitBtn", "infectionNowBtn"].forEach(id => {{
+    document.getElementById(id).disabled = selected.length === 0;
+  }});
+}}
+
+function renderSelectedDetails() {{
+  const root = document.getElementById("selectedDetails");
+  root.innerHTML = "";
+  const selected = selectedCultures();
+  if (!selected.length) return;
+
+  selected.forEach(c => {{
+    const card = document.createElement("div");
+    card.className = "card";
+    card.innerHTML = `<strong>${{escapeHtml(c.cell_line)}}</strong><br>
+      Plates: ${{c.plate_count}} · PD today: ${{effectivePdToday(c).toFixed(1)}}<br>
+      Plated: ${{escapeHtml(c.plated_date || "Not set")}} · Media: ${{escapeHtml(c.last_media_change || "Not set")}} · Split: ${{escapeHtml(c.last_split_check || "Not set")}}<br>
+      Notes: ${{escapeHtml(c.notes || "")}}`;
+    root.appendChild(card);
+  }});
+}}
+
+function renderInfection() {{
+  const root = document.getElementById("infectionRows");
+  root.innerHTML = "";
+  const rows = [];
+
+  cultures.forEach(c => {{
+    infectionTimepoints(c).forEach(tp => {{
+      rows.push({{
+        cell_line: c.cell_line,
+        timepoint: tp.label,
+        datetime: formatDatetime(tp.dt),
+        status: tp.dt < swedenDateObj() ? "past" : "upcoming"
+      }});
+    }});
+  }});
+
+  if (!rows.length) {{
+    root.textContent = "No active infection timepoints.";
+    return;
+  }}
+
+  const table = document.createElement("table");
+  table.innerHTML = "<thead><tr><th>Cell line</th><th>Timepoint</th><th>Date/time</th><th>Status</th></tr></thead>";
+  const tbody = document.createElement("tbody");
+  rows.forEach(r => {{
+    const tr = document.createElement("tr");
+    [r.cell_line, r.timepoint, r.datetime, r.status].forEach(text => {{
+      const td = document.createElement("td");
+      td.textContent = text;
+      tr.appendChild(td);
+    }});
+    tbody.appendChild(tr);
+  }});
+  table.appendChild(tbody);
+  root.appendChild(table);
+}}
+
+function renderRaw() {{
+  document.getElementById("rawData").textContent = JSON.stringify(cultures, null, 2);
+}}
+
+function renderEditForm() {{
+  const selected = selectedCultures();
+  const empty = document.getElementById("editEmpty");
+  const root = document.getElementById("editForm");
+
+  root.innerHTML = "";
+  if (selected.length !== 1) {{
+    empty.textContent = selected.length > 1 ? "Select only one culture to edit." : "Select one culture from the dashboard first.";
+    empty.classList.remove("hidden");
+    return;
+  }}
+
+  empty.classList.add("hidden");
+  root.appendChild(cultureForm(selected[0], false));
+}}
+
+function cultureForm(culture=null, isAdd=true) {{
+  const c = culture ? {{...culture}} : normalizeCulture({{ pd_date: swedenTodayString(), plate_count: 1 }});
+  const wrap = document.createElement("div");
+
+  wrap.innerHTML = `
+    <div class="form-grid">
+      ${{fieldHtml("Cell line", "cell_line", c.cell_line, "text", true)}}
+      ${{fieldHtml("Number of plates", "plate_count", c.plate_count, "number")}}
+      ${{fieldHtml("Date plated", "plated_date", c.plated_date, "text", false, "YYYY-MM-DD")}}
+      ${{fieldHtml("Date revived", "revived_date", c.revived_date, "text", false, "YYYY-MM-DD")}}
+      ${{fieldHtml("Current PD", "current_pd", c.current_pd, "number")}}
+      ${{fieldHtml("PD date", "pd_date", c.pd_date, "text", false, "YYYY-MM-DD")}}
+      ${{fieldHtml("Last media change", "last_media_change", c.last_media_change, "text", false, "YYYY-MM-DD")}}
+      ${{fieldHtml("Last split check", "last_split_check", c.last_split_check, "text", false, "YYYY-MM-DD")}}
+      ${{fieldHtml("Drug name", "drug_name", c.drug_name)}}
+      ${{fieldHtml("Drug added", "drug_added_datetime", c.drug_added_datetime, "text", false, "YYYY-MM-DD HH:MM")}}
+      <div>
+        <label>Infection active</label>
+        <select data-field="infection_active">
+          <option value="false" ${{!c.infection_active ? "selected" : ""}}>No</option>
+          <option value="true" ${{c.infection_active ? "selected" : ""}}>Yes</option>
+        </select>
+      </div>
+      ${{fieldHtml("1st infection", "first_infection_datetime", c.first_infection_datetime, "text", false, "YYYY-MM-DD HH:MM")}}
+      <div class="full">
+        <label>Notes</label>
+        <textarea data-field="notes">${{escapeHtml(c.notes)}}</textarea>
+      </div>
+    </div>
+    <div class="form-actions">
+      <button class="primary" data-action="save">${{isAdd ? "Add culture" : "Save changes"}}</button>
+      ${{!isAdd ? '<button data-action="duplicate">Duplicate</button><button class="danger" data-action="delete">Delete</button>' : ""}}
+      <button data-action="clear">Clear</button>
+    </div>
+  `;
+
+  wrap.querySelector('[data-action="save"]').addEventListener("click", () => {{
+    try {{
+      const newCulture = readCultureFromForm(wrap, c.id);
+      if (isAdd) {{
+        cultures.push(newCulture);
+        selectedIds.clear();
+        selectedIds.add(newCulture.id);
+        showTab("dashboard");
+      }} else {{
+        const idx = cultures.findIndex(x => x.id === culture.id);
+        if (idx >= 0) cultures[idx] = newCulture;
+      }}
+      renderAll();
+      scheduleSave();
+    }} catch (err) {{
+      alert(err.message);
+    }}
+  }});
+
+  const clear = wrap.querySelector('[data-action="clear"]');
+  clear.addEventListener("click", () => {{
+    if (isAdd) {{
+      document.getElementById("addForm").innerHTML = "";
+      document.getElementById("addForm").appendChild(cultureForm(null, true));
+    }} else {{
+      renderEditForm();
+    }}
+  }});
+
+  const dup = wrap.querySelector('[data-action="duplicate"]');
+  if (dup) {{
+    dup.addEventListener("click", () => {{
+      const copy = normalizeCulture({{...culture, id: uuid(), cell_line: culture.cell_line + " copy" }});
+      cultures.push(copy);
+      selectedIds.clear();
+      selectedIds.add(copy.id);
+      showTab("dashboard");
+      renderAll();
+      scheduleSave();
+    }});
+  }}
+
+  const del = wrap.querySelector('[data-action="delete"]');
+  if (del) {{
+    del.addEventListener("click", () => {{
+      if (confirm(`Delete “${{culture.cell_line}}”?`)) {{
+        cultures = cultures.filter(x => x.id !== culture.id);
+        selectedIds.delete(culture.id);
+        showTab("dashboard");
+        renderAll();
+        scheduleSave();
+      }}
+    }});
+  }}
+
+  return wrap;
+}}
+
+function fieldHtml(label, field, value, type="text", required=false, placeholder="") {{
+  return `<div>
+    <label>${{escapeHtml(label)}}</label>
+    <input data-field="${{field}}" type="${{type}}" value="${{escapeHtml(String(value || ""))}}" placeholder="${{escapeHtml(placeholder)}}" ${{required ? "required" : ""}} />
+  </div>`;
+}}
+
+function readCultureFromForm(root, existingId) {{
+  const get = field => {{
+    const el = root.querySelector(`[data-field="${{field}}"]`);
+    return el ? el.value.trim() : "";
+  }};
+
+  const c = normalizeCulture({{
+    id: existingId || uuid(),
+    cell_line: get("cell_line"),
+    plate_count: Number(get("plate_count") || 0),
+    plated_date: get("plated_date"),
+    revived_date: get("revived_date"),
+    current_pd: Number(get("current_pd") || 0),
+    pd_date: get("pd_date"),
+    last_media_change: get("last_media_change"),
+    last_split_check: get("last_split_check"),
+    drug_name: get("drug_name"),
+    drug_added_datetime: get("drug_added_datetime"),
+    infection_active: get("infection_active") === "true",
+    first_infection_datetime: get("first_infection_datetime"),
+    notes: get("notes")
+  }});
+
+  if (!c.cell_line) throw new Error("Cell line is required.");
+
+  ["plated_date", "revived_date", "pd_date", "last_media_change", "last_split_check"].forEach(field => {{
+    if (c[field] && !DATE_FMT_RE.test(c[field])) throw new Error(`${{field}} must be YYYY-MM-DD.`);
+  }});
+
+  ["drug_added_datetime", "first_infection_datetime"].forEach(field => {{
+    if (c[field] && !DATETIME_FMT_RE.test(c[field])) throw new Error(`${{field}} must be YYYY-MM-DD HH:MM.`);
+  }});
+
+  return c;
+}}
+
+function repairMissingDates() {{
+  const today = swedenTodayString();
+  let changed = 0;
+  cultures.forEach(c => {{
+    if (!normalizeDateString(c.plated_date)) {{
+      c.plated_date = today;
+      changed++;
+    }}
+    if (!normalizeDateString(c.last_media_change)) {{
+      c.last_media_change = c.plated_date || today;
+      changed++;
+    }}
+    if (!normalizeDateString(c.last_split_check)) {{
+      c.last_split_check = c.plated_date || today;
+      changed++;
+    }}
+  }});
+  renderAll();
+  scheduleSave();
+  alert(`Repaired ${{changed}} missing date field(s).`);
+}}
+
+function exportJson() {{
+  const blob = new Blob([JSON.stringify(cultures, null, 2)], {{ type: "application/json" }});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "incubator_tracker_backup.json";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}}
+
+function importJsonFile(file) {{
+  const reader = new FileReader();
+  reader.onload = () => {{
+    try {{
+      let data = JSON.parse(reader.result);
+      if (data && !Array.isArray(data) && Array.isArray(data.cultures)) data = data.cultures;
+      if (!Array.isArray(data)) throw new Error("JSON must be a list of cultures or an object with a cultures list.");
+      const imported = data.map(normalizeCulture);
+      if (confirm(`Replace current cultures with ${{imported.length}} imported culture(s)?`)) {{
+        cultures = imported;
+        selectedIds.clear();
+        if (confirm("Fill missing plated/media/split dates with today in Sweden?")) {{
+          repairMissingDates();
+        }} else {{
+          renderAll();
+          scheduleSave();
+        }}
+      }}
+    }} catch (err) {{
+      alert("Import failed: " + err.message);
+    }}
+  }};
+  reader.readAsText(file);
+}}
+
+function showTab(id) {{
+  document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === id));
+  document.querySelectorAll(".panel").forEach(p => p.classList.toggle("active", p.id === id));
+  if (id === "add") {{
+    document.getElementById("addForm").innerHTML = "";
+    document.getElementById("addForm").appendChild(cultureForm(null, true));
+  }}
+  if (id === "edit") renderEditForm();
+  if (id === "infection") renderInfection();
+  if (id === "raw") renderRaw();
+}}
+
+function escapeHtml(s) {{
+  return String(s ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}}
+
+document.querySelectorAll(".tab").forEach(tab => {{
+  tab.addEventListener("click", () => showTab(tab.dataset.tab));
+}});
+
+document.getElementById("reloadBtn").addEventListener("click", () => {{
+  if (dirty && !confirm("You have unsaved local changes. Reload anyway?")) return;
+  loadCultures();
+}});
+document.getElementById("saveBtn").addEventListener("click", () => saveCultures(true));
+document.getElementById("exportBtn").addEventListener("click", exportJson);
+document.getElementById("importBtn").addEventListener("click", () => document.getElementById("importFile").click());
+document.getElementById("importFile").addEventListener("change", e => {{
+  if (e.target.files && e.target.files[0]) importJsonFile(e.target.files[0]);
+  e.target.value = "";
+}});
+
+document.getElementById("mediaTodayBtn").addEventListener("click", () => {{
+  const today = swedenTodayString();
+  selectedCultures().forEach(c => c.last_media_change = today);
+  renderAll();
+  scheduleSave();
+}});
+document.getElementById("splitTodayBtn").addEventListener("click", () => {{
+  const today = swedenTodayString();
+  selectedCultures().forEach(c => c.last_split_check = today);
+  renderAll();
+  scheduleSave();
+}});
+document.getElementById("recordSplitBtn").addEventListener("click", () => {{
+  const today = swedenTodayString();
+  selectedCultures().forEach(c => {{
+    c.current_pd = effectivePdToday(c);
+    c.pd_date = today;
+    c.plated_date = today;
+    c.last_split_check = today;
+  }});
+  renderAll();
+  scheduleSave();
+}});
+document.getElementById("infectionNowBtn").addEventListener("click", () => {{
+  const now = swedenNowString();
+  selectedCultures().forEach(c => {{
+    c.infection_active = true;
+    c.first_infection_datetime = now;
+  }});
+  renderAll();
+  scheduleSave();
+}});
+document.getElementById("repairDatesBtn").addEventListener("click", repairMissingDates);
+
+window.addEventListener("beforeunload", () => {{
+  if (dirty) saveCultures(true);
+}});
+
+function updateSwedenClock() {{
+  const formatter = new Intl.DateTimeFormat("sv-SE", {{
+    timeZone: "Europe/Stockholm",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  }});
+  document.getElementById("swedenTime").textContent = formatter.format(new Date());
+}}
+
+setInterval(updateSwedenClock, 15000);
+updateSwedenClock();
+document.getElementById("addForm").appendChild(cultureForm(null, true));
+loadCultures();
+</script>
+</body>
+</html>
+"""
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
-    inject_low_flicker_css()
-    st.title(APP_TITLE)
-    st.caption(f"{APP_VERSION} · Sweden time: {sweden_now().strftime(DATETIME_FMT)}")
+    inject_css()
 
-    try:
-        cultures = load_cultures()
-    except Exception as exc:
-        st.error(f"Could not load data from Google Sheets backend: {exc}")
+    apps_script_url = get_secret("APPS_SCRIPT_URL", "").strip()
+    apps_script_token = get_secret("APPS_SCRIPT_TOKEN", "").strip()
+
+    if not apps_script_url:
+        st.error("Missing APPS_SCRIPT_URL in Streamlit secrets.")
         st.stop()
 
-    tab_dashboard, tab_add, tab_edit, tab_infection, tab_raw = st.tabs(
-        ["Dashboard", "Add culture", "Edit selected", "Infection timepoints", "Raw data"]
+    if not apps_script_token:
+        st.error("Missing APPS_SCRIPT_TOKEN in Streamlit secrets.")
+        st.stop()
+
+    components.html(
+        app_html(apps_script_url, apps_script_token),
+        height=1050,
+        scrolling=True,
     )
-
-    with tab_dashboard:
-        st.header("Due / overdue today")
-        render_alerts(cultures)
-
-        st.header("Cultures / Plates")
-        df = culture_table(cultures)
-        edited = st.data_editor(
-            df,
-            hide_index=True,
-            use_container_width=True,
-            disabled=[col for col in df.columns if col != "Select"],
-            column_config={"id": None, "Select": st.column_config.CheckboxColumn("Select")},
-            key="culture_selector",
-        )
-
-        selected = selected_cultures_from_editor(edited, cultures)
-        st.write(f"Selected: {len(selected)}")
-
-        col1, col2, col3, col4, col5 = st.columns(5)
-        today_str = sweden_today().strftime(DATE_FMT)
-        now_str = sweden_now().strftime(DATETIME_FMT)
-
-        if col1.button("Media changed today", disabled=not selected):
-            for c in selected:
-                c.last_media_change = today_str
-            save_cultures(cultures)
-            st.rerun()
-
-        if col2.button("Split checked today", disabled=not selected):
-            for c in selected:
-                c.last_split_check = today_str
-            save_cultures(cultures)
-            st.rerun()
-
-        if col3.button("Record split today", disabled=not selected):
-            for c in selected:
-                c.current_pd = c.effective_pd_today()
-                c.pd_date = today_str
-                c.plated_date = today_str
-                c.last_split_check = today_str
-            save_cultures(cultures)
-            st.rerun()
-
-        if col4.button("1st infection now", disabled=not selected):
-            for c in selected:
-                c.infection_active = True
-                c.first_infection_datetime = now_str
-            save_cultures(cultures)
-            st.rerun()
-
-        if col5.button("Refresh"):
-            force_reload_cultures()
-            st.rerun()
-
-        missing_schedule_dates = any(
-            not normalize_date_string(c.plated_date)
-            or not normalize_date_string(c.last_media_change)
-            or not normalize_date_string(c.last_split_check)
-            for c in cultures
-        )
-
-        if missing_schedule_dates:
-            st.warning(
-                "Some cultures have missing plated/media/split dates, so due dates show as Not set."
-            )
-            if st.button("Repair missing schedule dates using today in Sweden"):
-                changed = repair_missing_schedule_dates(cultures)
-                st.success(f"Repaired {changed} missing date field(s).")
-                st.rerun()
-
-        if selected:
-            st.subheader("Selected details")
-            for c in selected:
-                with st.expander(c.cell_line):
-                    st.json(asdict(c))
-
-    with tab_add:
-        render_form(cultures, form_key="add")
-
-    with tab_edit:
-        df = culture_table(cultures)
-        choices = {f"{c.cell_line} ({c.id[:8]})": c for c in sorted(cultures, key=lambda x: x.cell_line.lower())}
-        if not choices:
-            st.info("No cultures yet.")
-        else:
-            label = st.selectbox("Choose culture to edit", list(choices.keys()))
-            c = choices[label]
-            render_form(cultures, c, form_key="edit")
-
-            col_dup, col_delete = st.columns(2)
-            if col_dup.button("Duplicate this culture"):
-                copied = Culture.from_dict(asdict(c))
-                copied.id = str(uuid.uuid4())
-                copied.cell_line = copied.cell_line + " copy"
-                save_cultures(upsert_culture(cultures, copied))
-                st.rerun()
-
-            if col_delete.button("Delete this culture", type="secondary"):
-                save_cultures([x for x in cultures if x.id != c.id])
-                st.rerun()
-
-    with tab_infection:
-        rows = []
-        for c in cultures:
-            for label, dt in c.infection_timepoints():
-                rows.append({
-                    "Cell line": c.cell_line,
-                    "Timepoint": label,
-                    "Date/time": dt.strftime(DATETIME_FMT),
-                    "Status": "past" if dt < sweden_now() else "upcoming",
-                })
-        if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        else:
-            st.info("No active infection timepoints.")
-
-    with tab_raw:
-        st.download_button(
-            "Download JSON backup",
-            data=json.dumps([asdict(c) for c in cultures], indent=2),
-            file_name="incubator_tracker_backup.json",
-            mime="application/json",
-        )
-
-        uploaded = st.file_uploader("Import JSON backup", type=["json"])
-        if uploaded is not None:
-            try:
-                data = json.loads(uploaded.read().decode("utf-8"))
-
-                # Accept both backup formats:
-                # 1) New online format: [ {culture}, {culture}, ... ]
-                # 2) Old local app format: {"version": 2, "cultures": [ ... ]}
-                if isinstance(data, dict):
-                    if isinstance(data.get("cultures"), list):
-                        data = data["cultures"]
-                    else:
-                        raise ValueError("This JSON object does not contain a 'cultures' list.")
-                elif not isinstance(data, list):
-                    raise ValueError("The JSON file must contain either a list of cultures or an object with a 'cultures' list.")
-
-                imported = [Culture.from_dict(item) for item in data]
-                st.success(f"Ready to import {len(imported)} culture record(s). Due dates will be calculated using Sweden time.")
-
-                fill_missing = st.checkbox(
-                    "Fill missing plated/media/split dates with today in Sweden during import",
-                    value=True,
-                )
-
-                if st.button("Replace Google Sheet data with uploaded JSON"):
-                    if fill_missing:
-                        repair_missing_schedule_dates(imported)
-                    else:
-                        save_cultures(imported)
-                    st.success("Imported into Google Sheet.")
-                    st.rerun()
-            except Exception as exc:
-                st.error(f"Could not import JSON: {exc}")
-
-        st.dataframe(pd.DataFrame([asdict(c) for c in cultures]), use_container_width=True)
 
 
 if __name__ == "__main__":
