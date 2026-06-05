@@ -12,6 +12,7 @@ import json
 import uuid
 from dataclasses import dataclass, asdict, field
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -20,7 +21,7 @@ import streamlit as st
 
 
 APP_TITLE = "Incubator Tracker"
-APP_VERSION = "online-apps-script-v1.2-unique-widget-keys"
+APP_VERSION = "online-apps-script-v1.3-sweden-time-import-fix"
 
 DATE_FMT = "%Y-%m-%d"
 DATETIME_FMT = "%Y-%m-%d %H:%M"
@@ -28,6 +29,18 @@ MEDIA_INTERVAL_DAYS = 2
 SPLIT_CHECK_INTERVAL_DAYS = 2
 INFECTION_T0_OFFSET_HOURS = 12
 INFECTION_TARGET_HOURS = [72, 84, 96, 108, 120, 132, 144]
+
+SWEDEN_TZ = ZoneInfo("Europe/Stockholm")
+
+
+def sweden_now() -> datetime:
+    """Current date/time in Sweden, independent of Streamlit server timezone."""
+    return datetime.now(SWEDEN_TZ).replace(second=0, microsecond=0).replace(tzinfo=None)
+
+
+def sweden_today() -> date:
+    """Current date in Sweden, independent of Streamlit server timezone."""
+    return sweden_now().date()
 
 
 @dataclass
@@ -49,12 +62,49 @@ class Culture:
 
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "Culture":
+        """Load one culture from either the online format or the old local JSON format."""
+        raw = dict(data or {})
+
+        # Keep only known Culture fields. This lets old JSON contain extra metadata safely.
         defaults = asdict(Culture())
-        defaults.update(data or {})
+        for key in list(raw.keys()):
+            if key not in defaults:
+                raw.pop(key, None)
+
+        defaults.update(raw)
         defaults["id"] = str(defaults.get("id") or str(uuid.uuid4()))
-        defaults["plate_count"] = int(float(defaults.get("plate_count") or 0))
-        defaults["current_pd"] = float(defaults.get("current_pd") or 0)
-        defaults["infection_active"] = bool(defaults.get("infection_active"))
+
+        try:
+            defaults["plate_count"] = int(float(defaults.get("plate_count") or 0))
+        except Exception:
+            defaults["plate_count"] = 0
+
+        try:
+            defaults["current_pd"] = float(defaults.get("current_pd") or 0)
+        except Exception:
+            defaults["current_pd"] = 0.0
+
+        active = defaults.get("infection_active")
+        if isinstance(active, str):
+            defaults["infection_active"] = active.strip().lower() in {"true", "1", "yes", "y", "on"}
+        else:
+            defaults["infection_active"] = bool(active)
+
+        # Normalize blank/None date-like fields to empty strings.
+        for key in [
+            "cell_line",
+            "plated_date",
+            "revived_date",
+            "pd_date",
+            "last_media_change",
+            "last_split_check",
+            "drug_name",
+            "drug_added_datetime",
+            "first_infection_datetime",
+            "notes",
+        ]:
+            defaults[key] = "" if defaults.get(key) is None else str(defaults.get(key))
+
         return Culture(**defaults)
 
     def date_value(self, attr: str) -> Optional[date]:
@@ -105,7 +155,7 @@ class Culture:
         d = self.pd_record_date()
         if d is None:
             return self.current_pd
-        return self.current_pd + max(0, (date.today() - d).days)
+        return self.current_pd + max(0, (sweden_today() - d).days)
 
     def infection_timepoints(self) -> List[tuple[str, datetime]]:
         first = self.first_infection()
@@ -172,7 +222,7 @@ def save_cultures(cultures: List[Culture]) -> None:
 def status_from_due(due: Optional[date]) -> str:
     if due is None:
         return "Not set"
-    delta = (due - date.today()).days
+    delta = (due - sweden_today()).days
     if delta < 0:
         return f"OVERDUE by {-delta} day(s)"
     if delta == 0:
@@ -183,8 +233,8 @@ def status_from_due(due: Optional[date]) -> str:
 
 
 def action_status(last_done: Optional[date], due: Optional[date]) -> str:
-    if last_done == date.today() and due is not None:
-        delta = (due - date.today()).days
+    if last_done == sweden_today() and due is not None:
+        delta = (due - sweden_today()).days
         if delta == 1:
             return "Done today; next tomorrow"
         return f"Done today; next in {delta} days"
@@ -194,7 +244,7 @@ def action_status(last_done: Optional[date], due: Optional[date]) -> str:
 def human_duration_since(dt: Optional[datetime]) -> str:
     if not dt:
         return ""
-    delta = datetime.now().replace(second=0, microsecond=0) - dt
+    delta = sweden_now() - dt
     future = delta.total_seconds() < 0
     if future:
         delta = -delta
@@ -280,55 +330,25 @@ def validate_datetime(value: str, label: str) -> str:
     return value
 
 
-def render_form(cultures: List[Culture], editing: Optional[Culture] = None, form_key: str = "culture_form") -> None:
-    """Render Add/Edit form with globally unique widget keys.
-
-    Streamlit requires widget keys to be unique across the whole page, even when
-    widgets are inside different tabs or forms. The previous version reused keys
-    like `plated_date_form` in both Add and Edit tabs, causing
-    StreamlitDuplicateElementKey. The `form_key` prefix fixes that.
-    """
-    c = editing or Culture(pd_date=date.today().strftime(DATE_FMT))
+def render_form(cultures: List[Culture], editing: Optional[Culture] = None, form_key: str = "form") -> None:
+    c = editing or Culture(pd_date=sweden_today().strftime(DATE_FMT))
     title = "Edit culture" if editing else "Add culture"
-
-    # Include part of the culture id for edit forms so changing the selected
-    # culture does not reuse stale widget state from a different culture.
-    unique_prefix = f"{form_key}_{c.id[:8] if editing else 'new'}"
-
-    with st.form(key=f"{unique_prefix}_form"):
+    key_prefix = f"{form_key}_{c.id}"
+    with st.form(f"{title}_{key_prefix}"):
         st.subheader(title)
-        cell_line = st.text_input("Cell line", c.cell_line, key=f"{unique_prefix}_cell_line")
-        plate_count = st.number_input(
-            "Number of plates",
-            min_value=0,
-            value=int(c.plate_count),
-            step=1,
-            key=f"{unique_prefix}_plate_count",
-        )
-        plated_date = date_input_or_blank("Date plated", c.plated_date, f"{unique_prefix}_plated_date")
-        revived_date = date_input_or_blank("Date revived", c.revived_date, f"{unique_prefix}_revived_date")
-        current_pd = st.number_input(
-            "Current PD",
-            value=float(c.current_pd),
-            step=0.5,
-            key=f"{unique_prefix}_current_pd",
-        )
-        pd_date = date_input_or_blank("PD date", c.pd_date, f"{unique_prefix}_pd_date")
-        last_media = date_input_or_blank("Last media change", c.last_media_change, f"{unique_prefix}_last_media")
-        last_split = date_input_or_blank("Last split check", c.last_split_check, f"{unique_prefix}_last_split")
-        drug_name = st.text_input("Drug name", c.drug_name, key=f"{unique_prefix}_drug_name")
-        drug_added = datetime_input_or_blank("Drug added", c.drug_added_datetime, f"{unique_prefix}_drug_added")
-        infection_active = st.checkbox(
-            "Infection active",
-            value=bool(c.infection_active),
-            key=f"{unique_prefix}_infection_active",
-        )
-        first_infection = datetime_input_or_blank(
-            "1st infection",
-            c.first_infection_datetime,
-            f"{unique_prefix}_first_infection",
-        )
-        notes = st.text_area("Notes", c.notes, key=f"{unique_prefix}_notes")
+        cell_line = st.text_input("Cell line", c.cell_line, key=f"{key_prefix}_cell_line")
+        plate_count = st.number_input("Number of plates", min_value=0, value=int(c.plate_count), step=1, key=f"{key_prefix}_plate_count")
+        plated_date = date_input_or_blank("Date plated", c.plated_date, f"{key_prefix}_plated_date")
+        revived_date = date_input_or_blank("Date revived", c.revived_date, f"{key_prefix}_revived_date")
+        current_pd = st.number_input("Current PD", value=float(c.current_pd), step=0.5, key=f"{key_prefix}_current_pd")
+        pd_date = date_input_or_blank("PD date", c.pd_date, f"{key_prefix}_pd_date")
+        last_media = date_input_or_blank("Last media change", c.last_media_change, f"{key_prefix}_last_media")
+        last_split = date_input_or_blank("Last split check", c.last_split_check, f"{key_prefix}_last_split")
+        drug_name = st.text_input("Drug name", c.drug_name, key=f"{key_prefix}_drug_name")
+        drug_added = datetime_input_or_blank("Drug added", c.drug_added_datetime, f"{key_prefix}_drug_added")
+        infection_active = st.checkbox("Infection active", value=bool(c.infection_active), key=f"{key_prefix}_infection_active")
+        first_infection = datetime_input_or_blank("1st infection", c.first_infection_datetime, f"{key_prefix}_first_infection")
+        notes = st.text_area("Notes", c.notes, key=f"{key_prefix}_notes")
         submitted = st.form_submit_button("Save")
 
     if submitted:
@@ -355,19 +375,20 @@ def render_form(cultures: List[Culture], editing: Optional[Culture] = None, form
         except ValueError as exc:
             st.error(str(exc))
 
+
 def render_alerts(cultures: List[Culture]) -> None:
     alerts = []
     for c in cultures:
         media_due = c.next_media_due()
         split_due = c.next_split_due()
-        if media_due and media_due <= date.today():
+        if media_due and media_due <= sweden_today():
             alerts.append(f"{c.cell_line}: media change {status_from_due(media_due).lower()}.")
-        if split_due and split_due <= date.today():
+        if split_due and split_due <= sweden_today():
             alerts.append(f"{c.cell_line}: split check {status_from_due(split_due).lower()}.")
         if c.infection_active:
-            now = datetime.now().replace(second=0, microsecond=0)
+            now = sweden_now()
             for label, dt in c.infection_timepoints():
-                if dt.date() == date.today() and dt >= now:
+                if dt.date() == sweden_today() and dt >= now:
                     alerts.append(f"{c.cell_line}: infection {label} today at {dt.strftime('%H:%M')}.")
     if not alerts:
         st.info("No due or overdue tasks today.")
@@ -379,7 +400,7 @@ def render_alerts(cultures: List[Culture]) -> None:
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption(APP_VERSION)
+    st.caption(f"{APP_VERSION} · Sweden time: {sweden_now().strftime(DATETIME_FMT)}")
 
     try:
         cultures = load_cultures()
@@ -410,8 +431,8 @@ def main() -> None:
         st.write(f"Selected: {len(selected)}")
 
         col1, col2, col3, col4, col5 = st.columns(5)
-        today_str = date.today().strftime(DATE_FMT)
-        now_str = datetime.now().replace(second=0, microsecond=0).strftime(DATETIME_FMT)
+        today_str = sweden_today().strftime(DATE_FMT)
+        now_str = sweden_now().strftime(DATETIME_FMT)
 
         if col1.button("Media changed today", disabled=not selected):
             for c in selected:
@@ -452,7 +473,7 @@ def main() -> None:
                     st.json(asdict(c))
 
     with tab_add:
-        render_form(cultures, form_key="add_culture")
+        render_form(cultures, form_key="add")
 
     with tab_edit:
         df = culture_table(cultures)
@@ -462,17 +483,17 @@ def main() -> None:
         else:
             label = st.selectbox("Choose culture to edit", list(choices.keys()))
             c = choices[label]
-            render_form(cultures, c, form_key="edit_culture")
+            render_form(cultures, c, form_key="edit")
 
             col_dup, col_delete = st.columns(2)
-            if col_dup.button("Duplicate this culture", key="edit_duplicate_button"):
+            if col_dup.button("Duplicate this culture"):
                 copied = Culture.from_dict(asdict(c))
                 copied.id = str(uuid.uuid4())
                 copied.cell_line = copied.cell_line + " copy"
                 save_cultures(upsert_culture(cultures, copied))
                 st.rerun()
 
-            if col_delete.button("Delete this culture", type="secondary", key="edit_delete_button"):
+            if col_delete.button("Delete this culture", type="secondary"):
                 save_cultures([x for x in cultures if x.id != c.id])
                 st.rerun()
 
@@ -484,7 +505,7 @@ def main() -> None:
                     "Cell line": c.cell_line,
                     "Timepoint": label,
                     "Date/time": dt.strftime(DATETIME_FMT),
-                    "Status": "past" if dt < datetime.now() else "upcoming",
+                    "Status": "past" if dt < sweden_now() else "upcoming",
                 })
         if rows:
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -516,9 +537,9 @@ def main() -> None:
                     raise ValueError("The JSON file must contain either a list of cultures or an object with a 'cultures' list.")
 
                 imported = [Culture.from_dict(item) for item in data]
-                st.success(f"Ready to import {len(imported)} culture record(s).")
+                st.success(f"Ready to import {len(imported)} culture record(s). Due dates will be calculated using Sweden time.")
 
-                if st.button("Replace Google Sheet data with uploaded JSON", key="replace_google_sheet_from_json"):
+                if st.button("Replace Google Sheet data with uploaded JSON"):
                     save_cultures(imported)
                     st.success("Imported into Google Sheet.")
                     st.rerun()
