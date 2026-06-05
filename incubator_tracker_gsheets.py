@@ -21,7 +21,7 @@ import streamlit as st
 
 
 APP_TITLE = "Incubator Tracker"
-APP_VERSION = "online-apps-script-v1.5-faster-clicks"
+APP_VERSION = "online-apps-script-v1.6-faster-clicks-date-repair"
 
 DATE_FMT = "%Y-%m-%d"
 DATETIME_FMT = "%Y-%m-%d %H:%M"
@@ -34,13 +34,84 @@ SWEDEN_TZ = ZoneInfo("Europe/Stockholm")
 
 
 def sweden_now() -> datetime:
-    """Current date/time in Sweden, independent of the Streamlit server timezone."""
+    """Current date/time in Sweden, independent of Streamlit server timezone."""
     return datetime.now(SWEDEN_TZ).replace(second=0, microsecond=0).replace(tzinfo=None)
 
 
 def sweden_today() -> date:
-    """Current date in Sweden, independent of the Streamlit server timezone."""
+    """Current date in Sweden, independent of Streamlit server timezone."""
     return sweden_now().date()
+
+
+def normalize_date_string(value: Any) -> str:
+    """Normalize old JSON/Google Sheets date values to YYYY-MM-DD."""
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime(DATE_FMT)
+    if isinstance(value, date):
+        return value.strftime(DATE_FMT)
+
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "nan", "nat"}:
+        return ""
+
+    # Already valid date
+    try:
+        return datetime.strptime(text, DATE_FMT).strftime(DATE_FMT)
+    except ValueError:
+        pass
+
+    # Google/Apps Script sometimes returns datetime-like strings.
+    for fmt in (
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%m/%d/%Y",
+        "%d/%m/%Y",
+    ):
+        try:
+            return datetime.strptime(text.replace("Z", "Z"), fmt).strftime(DATE_FMT)
+        except ValueError:
+            continue
+
+    # Fallback: keep first 10 chars if they look like YYYY-MM-DD.
+    if len(text) >= 10 and text[4:5] == "-" and text[7:8] == "-":
+        return text[:10]
+
+    return text
+
+
+def normalize_datetime_string(value: Any) -> str:
+    """Normalize old JSON/Google Sheets datetime values to YYYY-MM-DD HH:MM."""
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime(DATETIME_FMT)
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time()).strftime(DATETIME_FMT)
+
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "nan", "nat"}:
+        return ""
+
+    for fmt in (
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%dT%H:%M:%SZ",
+    ):
+        try:
+            return datetime.strptime(text, fmt).strftime(DATETIME_FMT)
+        except ValueError:
+            continue
+
+    if len(text) >= 16 and text[4:5] == "-" and text[7:8] == "-":
+        return text[:16].replace("T", " ")
+
+    return text
 
 
 
@@ -67,6 +138,7 @@ class Culture:
         raw = dict(data or {})
         defaults = asdict(Culture())
 
+        # Drop unrelated top-level metadata from old JSON files.
         for key in list(raw.keys()):
             if key not in defaults:
                 raw.pop(key, None)
@@ -90,24 +162,19 @@ class Culture:
         else:
             defaults["infection_active"] = bool(active)
 
-        for key in [
-            "cell_line",
-            "plated_date",
-            "revived_date",
-            "pd_date",
-            "last_media_change",
-            "last_split_check",
-            "drug_name",
-            "drug_added_datetime",
-            "first_infection_datetime",
-            "notes",
-        ]:
+        for key in ["plated_date", "revived_date", "pd_date", "last_media_change", "last_split_check"]:
+            defaults[key] = normalize_date_string(defaults.get(key))
+
+        for key in ["drug_added_datetime", "first_infection_datetime"]:
+            defaults[key] = normalize_datetime_string(defaults.get(key))
+
+        for key in ["cell_line", "drug_name", "notes"]:
             defaults[key] = "" if defaults.get(key) is None else str(defaults.get(key))
 
         return Culture(**defaults)
 
     def date_value(self, attr: str) -> Optional[date]:
-        value = str(getattr(self, attr) or "").strip()
+        value = normalize_date_string(getattr(self, attr) or "")
         if not value:
             return None
         try:
@@ -116,7 +183,7 @@ class Culture:
             return None
 
     def datetime_value(self, attr: str) -> Optional[datetime]:
-        value = str(getattr(self, attr) or "").strip()
+        value = normalize_datetime_string(getattr(self, attr) or "")
         if not value:
             return None
         try:
@@ -230,6 +297,31 @@ def save_cultures(cultures: List[Culture]) -> None:
     st.session_state["cultures"] = cultures
     api_call("save", [asdict(c) for c in cultures])
     load_cultures_cached.clear()
+
+
+def repair_missing_schedule_dates(cultures: List[Culture]) -> int:
+    """Fill missing baseline dates so Media/Split due dates can be calculated."""
+    today_str = sweden_today().strftime(DATE_FMT)
+    changed = 0
+
+    for c in cultures:
+        if not normalize_date_string(c.plated_date):
+            c.plated_date = today_str
+            changed += 1
+        if not normalize_date_string(c.last_media_change):
+            c.last_media_change = c.plated_date or today_str
+            changed += 1
+        if not normalize_date_string(c.last_split_check):
+            c.last_split_check = c.plated_date or today_str
+            changed += 1
+
+        c.plated_date = normalize_date_string(c.plated_date)
+        c.last_media_change = normalize_date_string(c.last_media_change)
+        c.last_split_check = normalize_date_string(c.last_split_check)
+
+    if changed:
+        save_cultures(cultures)
+    return changed
 
 
 def status_from_due(due: Optional[date]) -> str:
@@ -416,18 +508,11 @@ def inject_low_flicker_css() -> None:
     st.markdown(
         """
         <style>
-        .stApp {
-            transition: none !important;
-        }
-
-        [data-testid="stStatusWidget"] {
-            display: none !important;
-        }
-
+        .stApp { transition: none !important; }
+        [data-testid="stStatusWidget"] { display: none !important; }
         button, input, textarea, select, [role="button"], [data-testid="stDataFrame"] {
             transition: none !important;
         }
-
         .block-container {
             padding-top: 2rem;
             padding-bottom: 2rem;
@@ -508,88 +593,13 @@ def main() -> None:
             force_reload_cultures()
             st.rerun()
 
-        if selected:
-            st.subheader("Selected details")
-            for c in selected:
-                with st.expander(c.cell_line):
-                    st.json(asdict(c))
-
-    with tab_add:
-        render_form(cultures, form_key="add")
-
-    with tab_edit:
-        df = culture_table(cultures)
-        choices = {f"{c.cell_line} ({c.id[:8]})": c for c in sorted(cultures, key=lambda x: x.cell_line.lower())}
-        if not choices:
-            st.info("No cultures yet.")
-        else:
-            label = st.selectbox("Choose culture to edit", list(choices.keys()))
-            c = choices[label]
-            render_form(cultures, c, form_key="edit")
-
-            col_dup, col_delete = st.columns(2)
-            if col_dup.button("Duplicate this culture"):
-                copied = Culture.from_dict(asdict(c))
-                copied.id = str(uuid.uuid4())
-                copied.cell_line = copied.cell_line + " copy"
-                save_cultures(upsert_culture(cultures, copied))
-                st.rerun()
-
-            if col_delete.button("Delete this culture", type="secondary"):
-                save_cultures([x for x in cultures if x.id != c.id])
-                st.rerun()
-
-    with tab_infection:
-        rows = []
-        for c in cultures:
-            for label, dt in c.infection_timepoints():
-                rows.append({
-                    "Cell line": c.cell_line,
-                    "Timepoint": label,
-                    "Date/time": dt.strftime(DATETIME_FMT),
-                    "Status": "past" if dt < sweden_now() else "upcoming",
-                })
-        if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        else:
-            st.info("No active infection timepoints.")
-
-    with tab_raw:
-        st.download_button(
-            "Download JSON backup",
-            data=json.dumps([asdict(c) for c in cultures], indent=2),
-            file_name="incubator_tracker_backup.json",
-            mime="application/json",
-        )
-
-        uploaded = st.file_uploader("Import JSON backup", type=["json"])
-        if uploaded is not None:
-            try:
-                data = json.loads(uploaded.read().decode("utf-8"))
-
-                # Accept both backup formats:
-                # 1) New online format: [ {culture}, {culture}, ... ]
-                # 2) Old local app format: {"version": 2, "cultures": [ ... ]}
-                if isinstance(data, dict):
-                    if isinstance(data.get("cultures"), list):
-                        data = data["cultures"]
-                    else:
-                        raise ValueError("This JSON object does not contain a 'cultures' list.")
-                elif not isinstance(data, list):
-                    raise ValueError("The JSON file must contain either a list of cultures or an object with a 'cultures' list.")
-
-                imported = [Culture.from_dict(item) for item in data]
-                st.success(f"Ready to import {len(imported)} culture record(s). Due dates will be calculated using Sweden time.")
-
-                if st.button("Replace Google Sheet data with uploaded JSON"):
-                    save_cultures(imported)
-                    st.success("Imported into Google Sheet.")
-                    st.rerun()
-            except Exception as exc:
-                st.error(f"Could not import JSON: {exc}")
-
-        st.dataframe(pd.DataFrame([asdict(c) for c in cultures]), use_container_width=True)
-
-
-if __name__ == "__main__":
-    main()
+        if any(
+            not normalize_date_string(c.plated_date)
+            or not normalize_date_string(c.last_media_change)
+            or not normalize_date_string(c.last_split_check)
+            for c in cultures
+        ):
+            st.warning(
+                "Some cultures have missing plated/media/split dates, so due dates show as Not set."
+            )
+            if st.button("Repair missing schedule dates using today in Sweden"):
