@@ -21,7 +21,7 @@ import streamlit as st
 
 
 APP_TITLE = "Incubator Tracker"
-APP_VERSION = "online-apps-script-v1.4-date-parser-import-repair"
+APP_VERSION = "online-apps-script-v1.5-faster-clicks"
 
 DATE_FMT = "%Y-%m-%d"
 DATETIME_FMT = "%Y-%m-%d %H:%M"
@@ -34,13 +34,14 @@ SWEDEN_TZ = ZoneInfo("Europe/Stockholm")
 
 
 def sweden_now() -> datetime:
-    """Current date/time in Sweden, independent of Streamlit server timezone."""
+    """Current date/time in Sweden, independent of the Streamlit server timezone."""
     return datetime.now(SWEDEN_TZ).replace(second=0, microsecond=0).replace(tzinfo=None)
 
 
 def sweden_today() -> date:
-    """Current date in Sweden, independent of Streamlit server timezone."""
+    """Current date in Sweden, independent of the Streamlit server timezone."""
     return sweden_now().date()
+
 
 
 @dataclass
@@ -64,9 +65,8 @@ class Culture:
     def from_dict(data: Dict[str, Any]) -> "Culture":
         """Load one culture from either the online format or the old local JSON format."""
         raw = dict(data or {})
-
-        # Keep only known Culture fields. This lets old JSON contain extra metadata safely.
         defaults = asdict(Culture())
+
         for key in list(raw.keys()):
             if key not in defaults:
                 raw.pop(key, None)
@@ -90,7 +90,6 @@ class Culture:
         else:
             defaults["infection_active"] = bool(active)
 
-        # Normalize blank/None date-like fields to empty strings.
         for key in [
             "cell_line",
             "plated_date",
@@ -111,38 +110,18 @@ class Culture:
         value = str(getattr(self, attr) or "").strip()
         if not value:
             return None
-
-        # Google Sheets can return date-looking cells as either
-        # YYYY-MM-DD or YYYY-MM-DD HH:MM, depending on how Sheets stored them.
-        # Accept both so imported local JSON dates are interpreted correctly.
-        for fmt in (DATE_FMT, DATETIME_FMT):
-            try:
-                return datetime.strptime(value, fmt).date()
-            except ValueError:
-                pass
-
-        # Last fallback for ISO-like strings such as 2026-06-05T14:30:00.
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
-        except Exception:
+            return datetime.strptime(value, DATE_FMT).date()
+        except ValueError:
             return None
 
     def datetime_value(self, attr: str) -> Optional[datetime]:
         value = str(getattr(self, attr) or "").strip()
         if not value:
             return None
-
-        for fmt in (DATETIME_FMT, DATE_FMT):
-            try:
-                parsed = datetime.strptime(value, fmt)
-                return parsed.replace(second=0, microsecond=0)
-            except ValueError:
-                pass
-
         try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            return parsed.replace(tzinfo=None, second=0, microsecond=0)
-        except Exception:
+            return datetime.strptime(value, DATETIME_FMT)
+        except ValueError:
             return None
 
     def plated(self) -> Optional[date]:
@@ -225,16 +204,30 @@ def api_call(action: str, cultures: Optional[List[Dict[str, Any]]] = None) -> Di
     return data
 
 
-@st.cache_data(ttl=10, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def load_cultures_cached() -> List[Dict[str, Any]]:
+    """Network load from Google Sheets backend. Cached to avoid reloading on every click."""
     return api_call("load").get("cultures", [])
 
 
+def force_reload_cultures() -> List[Culture]:
+    """Force a fresh load from Google Sheets into the current Streamlit session."""
+    load_cultures_cached.clear()
+    cultures = [Culture.from_dict(item) for item in load_cultures_cached()]
+    st.session_state["cultures"] = cultures
+    return cultures
+
+
 def load_cultures() -> List[Culture]:
-    return [Culture.from_dict(item) for item in load_cultures_cached()]
+    """Load cultures from session memory first, avoiding a backend call on checkbox clicks."""
+    if "cultures" not in st.session_state:
+        st.session_state["cultures"] = [Culture.from_dict(item) for item in load_cultures_cached()]
+    return st.session_state["cultures"]
 
 
 def save_cultures(cultures: List[Culture]) -> None:
+    """Save to Google Sheets and keep the current session state in sync."""
+    st.session_state["cultures"] = cultures
     api_call("save", [asdict(c) for c in cultures])
     load_cultures_cached.clear()
 
@@ -322,29 +315,6 @@ def upsert_culture(cultures: List[Culture], culture: Culture) -> List[Culture]:
             return cultures
     cultures.append(culture)
     return cultures
-
-
-def repair_missing_schedule_dates(cultures: List[Culture], fill_date: Optional[str] = None) -> tuple[List[Culture], int]:
-    """Fill only missing schedule baseline dates. Existing JSON dates are preserved.
-
-    This is useful after importing old data where the cell lines and PDs exist
-    but plated/media/split date fields are blank. The default fill date is
-    today's date in Sweden.
-    """
-    fill_date = fill_date or sweden_today().strftime(DATE_FMT)
-    changed = 0
-    for c in cultures:
-        before = (c.plated_date, c.last_media_change, c.last_split_check)
-        if not str(c.plated_date or "").strip():
-            c.plated_date = fill_date
-        if not str(c.last_media_change or "").strip():
-            c.last_media_change = c.plated_date or fill_date
-        if not str(c.last_split_check or "").strip():
-            c.last_split_check = c.plated_date or fill_date
-        after = (c.plated_date, c.last_media_change, c.last_split_check)
-        if after != before:
-            changed += 1
-    return cultures, changed
 
 
 def date_input_or_blank(label: str, value: str, key: str) -> str:
@@ -440,8 +410,37 @@ def render_alerts(cultures: List[Culture]) -> None:
             st.warning(alert)
 
 
+
+def inject_low_flicker_css() -> None:
+    """Reduce the grey/transparent flicker that appears during Streamlit reruns."""
+    st.markdown(
+        """
+        <style>
+        .stApp {
+            transition: none !important;
+        }
+
+        [data-testid="stStatusWidget"] {
+            display: none !important;
+        }
+
+        button, input, textarea, select, [role="button"], [data-testid="stDataFrame"] {
+            transition: none !important;
+        }
+
+        .block-container {
+            padding-top: 2rem;
+            padding-bottom: 2rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
+    inject_low_flicker_css()
     st.title(APP_TITLE)
     st.caption(f"{APP_VERSION} · Sweden time: {sweden_now().strftime(DATETIME_FMT)}")
 
@@ -461,23 +460,6 @@ def main() -> None:
 
         st.header("Cultures / Plates")
         df = culture_table(cultures)
-
-        missing_schedule = [
-            c for c in cultures
-            if c.next_media_due() is None or c.next_split_due() is None
-        ]
-        if missing_schedule:
-            st.warning(
-                f"{len(missing_schedule)} culture(s) have no usable plated/media/split date. "
-                "This usually means the old JSON did not contain those dates, or Google Sheets converted them into a date-time format. "
-                "Existing valid dates are preserved."
-            )
-            if st.button("Repair missing schedule dates using today in Sweden"):
-                repaired, changed = repair_missing_schedule_dates(cultures)
-                save_cultures(repaired)
-                st.success(f"Repaired {changed} culture(s) using Sweden date {sweden_today().strftime(DATE_FMT)}.")
-                st.rerun()
-
         edited = st.data_editor(
             df,
             hide_index=True,
@@ -523,7 +505,7 @@ def main() -> None:
             st.rerun()
 
         if col5.button("Refresh"):
-            load_cultures_cached.clear()
+            force_reload_cultures()
             st.rerun()
 
         if selected:
@@ -599,26 +581,7 @@ def main() -> None:
                 imported = [Culture.from_dict(item) for item in data]
                 st.success(f"Ready to import {len(imported)} culture record(s). Due dates will be calculated using Sweden time.")
 
-                missing_count = sum(
-                    1 for c in imported
-                    if c.next_media_due() is None or c.next_split_due() is None
-                )
-                repair_on_import = False
-                if missing_count:
-                    st.warning(
-                        f"{missing_count} imported culture(s) have missing/unusable schedule dates. "
-                        "If you leave them as-is, Media/Split will show 'Not set'."
-                    )
-                    repair_on_import = st.checkbox(
-                        "Fill missing plated/media/split dates with today's date in Sweden during import",
-                        value=True,
-                        key="repair_missing_dates_on_import",
-                    )
-
                 if st.button("Replace Google Sheet data with uploaded JSON"):
-                    if repair_on_import:
-                        imported, changed = repair_missing_schedule_dates(imported)
-                        st.info(f"Filled missing schedule dates for {changed} culture(s).")
                     save_cultures(imported)
                     st.success("Imported into Google Sheet.")
                     st.rerun()
