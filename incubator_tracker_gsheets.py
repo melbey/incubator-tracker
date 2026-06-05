@@ -473,10 +473,24 @@ def main() -> None:
         if uploaded is not None:
             try:
                 data = json.loads(uploaded.read().decode("utf-8"))
+
+                # Accept both backup formats:
+                # 1) New online format: [ {culture}, {culture}, ... ]
+                # 2) Old local app format: {"version": 2, "cultures": [ ... ]}
+                if isinstance(data, dict):
+                    if isinstance(data.get("cultures"), list):
+                        data = data["cultures"]
+                    else:
+                        raise ValueError("This JSON object does not contain a 'cultures' list.")
+                elif not isinstance(data, list):
+                    raise ValueError("The JSON file must contain either a list of cultures or an object with a 'cultures' list.")
+
                 imported = [Culture.from_dict(item) for item in data]
+                st.success(f"Ready to import {len(imported)} culture record(s).")
+
                 if st.button("Replace Google Sheet data with uploaded JSON"):
                     save_cultures(imported)
-                    st.success("Imported.")
+                    st.success("Imported into Google Sheet.")
                     st.rerun()
             except Exception as exc:
                 st.error(f"Could not import JSON: {exc}")
