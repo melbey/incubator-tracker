@@ -20,7 +20,7 @@ import streamlit as st
 
 
 APP_TITLE = "Incubator Tracker"
-APP_VERSION = "online-apps-script-v1"
+APP_VERSION = "online-apps-script-v1.2-unique-widget-keys"
 
 DATE_FMT = "%Y-%m-%d"
 DATETIME_FMT = "%Y-%m-%d %H:%M"
@@ -280,24 +280,55 @@ def validate_datetime(value: str, label: str) -> str:
     return value
 
 
-def render_form(cultures: List[Culture], editing: Optional[Culture] = None) -> None:
+def render_form(cultures: List[Culture], editing: Optional[Culture] = None, form_key: str = "culture_form") -> None:
+    """Render Add/Edit form with globally unique widget keys.
+
+    Streamlit requires widget keys to be unique across the whole page, even when
+    widgets are inside different tabs or forms. The previous version reused keys
+    like `plated_date_form` in both Add and Edit tabs, causing
+    StreamlitDuplicateElementKey. The `form_key` prefix fixes that.
+    """
     c = editing or Culture(pd_date=date.today().strftime(DATE_FMT))
     title = "Edit culture" if editing else "Add culture"
-    with st.form(title):
+
+    # Include part of the culture id for edit forms so changing the selected
+    # culture does not reuse stale widget state from a different culture.
+    unique_prefix = f"{form_key}_{c.id[:8] if editing else 'new'}"
+
+    with st.form(key=f"{unique_prefix}_form"):
         st.subheader(title)
-        cell_line = st.text_input("Cell line", c.cell_line)
-        plate_count = st.number_input("Number of plates", min_value=0, value=int(c.plate_count), step=1)
-        plated_date = date_input_or_blank("Date plated", c.plated_date, "plated_date_form")
-        revived_date = date_input_or_blank("Date revived", c.revived_date, "revived_date_form")
-        current_pd = st.number_input("Current PD", value=float(c.current_pd), step=0.5)
-        pd_date = date_input_or_blank("PD date", c.pd_date, "pd_date_form")
-        last_media = date_input_or_blank("Last media change", c.last_media_change, "last_media_form")
-        last_split = date_input_or_blank("Last split check", c.last_split_check, "last_split_form")
-        drug_name = st.text_input("Drug name", c.drug_name)
-        drug_added = datetime_input_or_blank("Drug added", c.drug_added_datetime, "drug_added_form")
-        infection_active = st.checkbox("Infection active", value=bool(c.infection_active))
-        first_infection = datetime_input_or_blank("1st infection", c.first_infection_datetime, "first_infection_form")
-        notes = st.text_area("Notes", c.notes)
+        cell_line = st.text_input("Cell line", c.cell_line, key=f"{unique_prefix}_cell_line")
+        plate_count = st.number_input(
+            "Number of plates",
+            min_value=0,
+            value=int(c.plate_count),
+            step=1,
+            key=f"{unique_prefix}_plate_count",
+        )
+        plated_date = date_input_or_blank("Date plated", c.plated_date, f"{unique_prefix}_plated_date")
+        revived_date = date_input_or_blank("Date revived", c.revived_date, f"{unique_prefix}_revived_date")
+        current_pd = st.number_input(
+            "Current PD",
+            value=float(c.current_pd),
+            step=0.5,
+            key=f"{unique_prefix}_current_pd",
+        )
+        pd_date = date_input_or_blank("PD date", c.pd_date, f"{unique_prefix}_pd_date")
+        last_media = date_input_or_blank("Last media change", c.last_media_change, f"{unique_prefix}_last_media")
+        last_split = date_input_or_blank("Last split check", c.last_split_check, f"{unique_prefix}_last_split")
+        drug_name = st.text_input("Drug name", c.drug_name, key=f"{unique_prefix}_drug_name")
+        drug_added = datetime_input_or_blank("Drug added", c.drug_added_datetime, f"{unique_prefix}_drug_added")
+        infection_active = st.checkbox(
+            "Infection active",
+            value=bool(c.infection_active),
+            key=f"{unique_prefix}_infection_active",
+        )
+        first_infection = datetime_input_or_blank(
+            "1st infection",
+            c.first_infection_datetime,
+            f"{unique_prefix}_first_infection",
+        )
+        notes = st.text_area("Notes", c.notes, key=f"{unique_prefix}_notes")
         submitted = st.form_submit_button("Save")
 
     if submitted:
@@ -323,7 +354,6 @@ def render_form(cultures: List[Culture], editing: Optional[Culture] = None) -> N
             st.rerun()
         except ValueError as exc:
             st.error(str(exc))
-
 
 def render_alerts(cultures: List[Culture]) -> None:
     alerts = []
@@ -422,7 +452,7 @@ def main() -> None:
                     st.json(asdict(c))
 
     with tab_add:
-        render_form(cultures)
+        render_form(cultures, form_key="add_culture")
 
     with tab_edit:
         df = culture_table(cultures)
@@ -432,17 +462,17 @@ def main() -> None:
         else:
             label = st.selectbox("Choose culture to edit", list(choices.keys()))
             c = choices[label]
-            render_form(cultures, c)
+            render_form(cultures, c, form_key="edit_culture")
 
             col_dup, col_delete = st.columns(2)
-            if col_dup.button("Duplicate this culture"):
+            if col_dup.button("Duplicate this culture", key="edit_duplicate_button"):
                 copied = Culture.from_dict(asdict(c))
                 copied.id = str(uuid.uuid4())
                 copied.cell_line = copied.cell_line + " copy"
                 save_cultures(upsert_culture(cultures, copied))
                 st.rerun()
 
-            if col_delete.button("Delete this culture", type="secondary"):
+            if col_delete.button("Delete this culture", type="secondary", key="edit_delete_button"):
                 save_cultures([x for x in cultures if x.id != c.id])
                 st.rerun()
 
@@ -488,7 +518,7 @@ def main() -> None:
                 imported = [Culture.from_dict(item) for item in data]
                 st.success(f"Ready to import {len(imported)} culture record(s).")
 
-                if st.button("Replace Google Sheet data with uploaded JSON"):
+                if st.button("Replace Google Sheet data with uploaded JSON", key="replace_google_sheet_from_json"):
                     save_cultures(imported)
                     st.success("Imported into Google Sheet.")
                     st.rerun()
